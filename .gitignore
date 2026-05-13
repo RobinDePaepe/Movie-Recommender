@@ -1,0 +1,51 @@
+# Ignore all files in the data folder (local caches, exports, etc.)
+/data/*
+
+# Environment files
+.env
+*.env
+
+# Comma-separated and spreadsheet data
+*.csv
+*.xls
+*.xlsx
+*.xlsm
+*.xlsb
+*.ods
+
+# Archives and cache
+*.zip
+*.tar.gz
+*.tgz
+*.gz
+
+# Databases
+*.sqlite
+*.db
+*.sqlite3
+
+# Python build / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Optional: keep a .gitkeep placeholder if you need the empty data directory tracked
+!data/.gitkeep
