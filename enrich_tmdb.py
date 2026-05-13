@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from dotenv import load_dotenv
 
 import pandas as pd
 
+
 from recommender import ensure_export_dir, load_letterboxd, prepare_metadata
+from letterboxd_sync import apply_sync_overlays
 from tmdb_client import TMDbClient, discover_movies_from_favorites, enrich_movies, metadata_from_cache
 
+load_dotenv()  # Add this
 
 def all_letterboxd_movies(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     frames = [
