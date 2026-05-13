@@ -25,6 +25,17 @@ TASTE_MODES: Dict[str, Dict[str, Any]] = {
     "High confidence": {"terms": [], "runtime": None, "min_metadata": True},
 }
 
+# Feedback labels for taste tuning
+FEEDBACK_LABELS = {
+    "more_like_this": {"weight": 1.5, "description": "More like this"},
+    "less_like_this": {"weight": -2.0, "description": "Less like this"},
+    "rewatchable": {"weight": 1.0, "description": "Rewatchable"},
+    "one_and_done": {"weight": -0.5, "description": "One and done"},
+    "interesting_but_not_more": {"weight": 0.3, "description": "Interesting but not more"},
+    "high_quality_not_my_taste": {"weight": -0.8, "description": "High quality, not my taste"},
+    "guilty_pleasure": {"weight": 0.7, "description": "Guilty pleasure"},
+}
+
 
 def _read_csv(path: Path, **kwargs) -> pd.DataFrame:
     if not path.exists():
@@ -315,9 +326,9 @@ def add_feedback_similarity(candidates: pd.DataFrame, feedback: pd.DataFrame, me
     corpus = fb["feature_text"].tolist() + out.loc[cand_idx, "feature_text"].fillna("").tolist()
     matrix = TfidfVectorizer(min_df=1, ngram_range=(1, 2), max_features=12000).fit_transform(corpus)
     sims = cosine_similarity(matrix[len(fb):], matrix[:len(fb)])
-    weights = fb["feedback"].map({"more_like_this": 1.5, "less_like_this": -2.0}).fillna(0).to_numpy()
+    weights = fb["feedback"].map({k: v["weight"] for k, v in FEEDBACK_LABELS.items()}).fillna(0).to_numpy()
     out.loc[cand_idx, "feedback_score"] = (sims @ weights).clip(-3.0, 3.0)
-    direct = feedback["feedback"].map({"more_like_this": 0.5, "less_like_this": -0.75}).fillna(0)
+    direct = feedback["feedback"].map({k: v["weight"] for k, v in FEEDBACK_LABELS.items()}).fillna(0)
     direct_adj = feedback.assign(direct_score=direct).groupby("movie_id", as_index=False)["direct_score"].sum()
     out = out.merge(direct_adj, on="movie_id", how="left")
     out["feedback_score"] = out["feedback_score"].fillna(0) + out["direct_score"].fillna(0)

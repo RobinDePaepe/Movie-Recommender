@@ -11,6 +11,7 @@ from recommender import (
     build_recommendations,
     ensure_export_dir,
     evaluate_historical_predictions,
+    FEEDBACK_LABELS,
     load_feedback,
     load_letterboxd,
     prepare_metadata,
@@ -345,6 +346,83 @@ elif page == "Analysis":
                     gstats = genre_df.groupby("genre", as_index=False).agg(avg_rating=("Rating", "mean"), count=("Rating", "count"))
                     gstats = gstats[gstats["count"] >= 3].sort_values(["avg_rating", "count"], ascending=False)
                     st.dataframe(gstats, use_container_width=True, hide_index=True)
+
+        # Tune watched movies section
+        st.subheader("Tune watched movies")
+        st.write("Use these labels to provide richer taste signals for better recommendations. This feedback is stronger than passive ratings.")
+
+        # Get watched/rated movies
+        watched_movies = data["watched"].copy()
+        rated_movies = data["ratings"].copy()
+        all_watched = pd.concat([watched_movies, rated_movies], ignore_index=True).drop_duplicates("movie_id")
+
+        if all_watched.empty:
+            st.info("No watched movies found.")
+        else:
+            # Merge with metadata and feedback
+            tuned_movies = all_watched.copy()
+            if not metadata.empty:
+                meta_prepared = prepare_metadata(metadata)
+                tuned_movies = tuned_movies.merge(
+                    meta_prepared[["movie_id", "overview", "genres", "directors", "poster_url"]],
+                    on="movie_id",
+                    how="left"
+                )
+            if not feedback.empty:
+                feedback_agg = feedback.groupby("movie_id")["feedback"].agg(list).reset_index()
+                tuned_movies = tuned_movies.merge(feedback_agg, on="movie_id", how="left")
+
+            # Add search/filter
+            search_term = st.text_input("Search movies", key="tune_search")
+            if search_term:
+                mask = (
+                    tuned_movies["Name"].str.lower().str.contains(search_term.lower(), na=False) |
+                    tuned_movies["Year"].astype(str).str.contains(search_term, na=False)
+                )
+                tuned_movies = tuned_movies[mask]
+
+            # Show movies with feedback controls
+            st.write(f"Showing {len(tuned_movies)} movies")
+            for idx, row in tuned_movies.iterrows():
+                with st.container():
+                    col1, col2, col3 = st.columns([1, 3, 2])
+                    with col1:
+                        if pd.notna(row.get("poster_url")):
+                            st.image(row["poster_url"], width=80)
+                        else:
+                            st.write("📽️")
+                    with col2:
+                        st.write(f"**{row['Name']} ({row['Year']})**")
+                        if pd.notna(row.get("overview")):
+                            st.caption(row["overview"][:200] + "..." if len(str(row["overview"])) > 200 else str(row["overview"]))
+                        genres = row.get("genres", [])
+                        if genres:
+                            st.caption("Genres: " + ", ".join(genres[:3]))
+                        rating = row.get("Rating")
+                        if pd.notna(rating):
+                            st.caption(f"Your rating: {rating}/5")
+                    with col3:
+                        current_feedback = row.get("feedback", [])
+                        if not isinstance(current_feedback, list):
+                            current_feedback = [current_feedback] if pd.notna(current_feedback) else []
+                        
+                        # Selectbox for feedback
+                        feedback_options = [""] + list(FEEDBACK_LABELS.keys())
+                        selected = st.selectbox(
+                            "Taste feedback",
+                            options=feedback_options,
+                            format_func=lambda x: FEEDBACK_LABELS.get(x, {}).get("description", x) if x else "No feedback",
+                            key=f"feedback_{row['movie_id']}_{idx}",
+                            index=feedback_options.index(current_feedback[0]) if current_feedback else 0
+                        )
+                        
+                        if selected and selected not in current_feedback:
+                            if st.button("Save feedback", key=f"save_{row['movie_id']}_{idx}"):
+                                save_feedback_to_db(row["movie_id"], selected) if use_database else save_feedback(row["movie_id"], selected)
+                                st.success(f"Saved '{FEEDBACK_LABELS[selected]['description']}' for {row['Name']}")
+                                st.rerun()
+                        elif current_feedback:
+                            st.caption(f"Current: {FEEDBACK_LABELS.get(current_feedback[0], {}).get('description', current_feedback[0])}")
 
 elif page == "Evaluation":
     st.subheader("Evaluation against historical ratings")
