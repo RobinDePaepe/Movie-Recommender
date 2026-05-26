@@ -4,7 +4,9 @@ import os
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import re
 
+from curator import CURATION_STYLES, anchor_options, build_curated_list
 from recommender import (
     apply_filters,
     available_filter_values,
@@ -35,6 +37,26 @@ from movie_database import (
 st.set_page_config(page_title="Personal Movie Recommender", layout="wide")
 st.title("Personal Movie Recommender MVP")
 st.caption("Letterboxd + TMDb recommendations with discovery, filters, feedback learning, poster cards, and evaluation.")
+
+
+def render_reasons(text: str, sep: str = ";") -> None:
+    """Render a separator-delimited reason string as markdown bullet points.
+
+    sep: delimiter string, commonly ';' for reasons or ',' for lists.
+    """
+    if not text:
+        return
+    s = str(text)
+    if sep == ";":
+        parts = [p.strip() for p in re.split(r';\s*', s) if p.strip()]
+    elif sep == ",":
+        parts = [p.strip() for p in s.split(',') if p.strip()]
+    else:
+        parts = [p.strip() for p in s.split(sep) if p.strip()]
+    if not parts:
+        return
+    md = "\n".join(f"- {p}" for p in parts)
+    st.markdown(md)
 
 export_zip = Path("data/letterboxd_export.zip")
 if not export_zip.exists():
@@ -174,7 +196,7 @@ mode = "outside_watchlist" if mode_label == "Not on my watchlist" else "watchlis
 
 filter_values_preview = available_filter_values(pd.DataFrame())
 taste_mode = st.sidebar.selectbox("Taste mode", filter_values_preview.get("taste_modes", ["Balanced"]), index=0)
-page = st.sidebar.radio("Page", ["Recommendations", "Analysis", "Evaluation", "Database", "Sync status"])
+page = st.sidebar.radio("Page", ["Recommendations", "Analysis", "Evaluation", "Curated Weeks", "Database", "Sync status"])
 
 recs, decade_prefs = build_recommendations(data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode)
 
@@ -207,7 +229,7 @@ def poster_card(row: pd.Series, idx: int) -> None:
     if rt or moods or genres:
         st.caption(" | ".join([x for x in [f"{rt} min" if rt else "", moods, genres] if x]))
     with st.expander("Why?"):
-        st.write(row.get("why_details", row.get("why", "")))
+        render_reasons(row.get("why_details", row.get("why", "")))
         if row.get("overview"):
             st.write(row.get("overview"))
     b1, b2 = st.columns(2)
@@ -217,6 +239,35 @@ def poster_card(row: pd.Series, idx: int) -> None:
     if b2.button("Less", key=f"less_{idx}_{row.get('movie_id')}"):
         store_feedback(row["movie_id"], "less_like_this")
         st.rerun()
+
+
+def curated_week_card(row: pd.Series) -> None:
+    genres = row.get("genres", []) if isinstance(row.get("genres"), list) else []
+    moods = row.get("moods", []) if isinstance(row.get("moods"), list) else []
+    runtime = row.get("runtime")
+
+    left, right = st.columns([1, 4])
+    with left:
+        if row.get("poster_url"):
+            st.image(row["poster_url"], use_container_width=True)
+        else:
+            st.info("No poster")
+    with right:
+        st.markdown(f"### Day {int(row.get('day', 0))}: {row.get('Name', '')} ({row.get('Year', '')})")
+        st.caption(f"{row.get('role', '')} | {row.get('role_description', '')}")
+        st.write(row.get("why", ""))
+        if genres:
+            st.caption("Genres: " + ", ".join(genres[:4]))
+        if moods:
+            st.caption("Moods: " + ", ".join(moods[:4]))
+        if pd.notna(runtime) and str(runtime).strip():
+            st.caption(f"Runtime: {runtime} min")
+        if row.get("overview"):
+            with st.expander("Overview", expanded=False):
+                st.write(row.get("overview"))
+        tmdb_url = row.get("tmdb_url")
+        if isinstance(tmdb_url, str) and tmdb_url:
+            st.link_button("Open in TMDb", tmdb_url)
 
 
 if page == "Recommendations":
@@ -268,10 +319,16 @@ if page == "Recommendations":
         if sel and sel != "- none -":
             row = details_frame.iloc[labels.index(sel)]
             with st.expander("Why this recommendation?", expanded=True):
-                st.write(row["why_details"] or row["why"])
+                render_reasons(row["why_details"] or row["why"])
             with st.expander("Matched lists & taste matches", expanded=False):
-                st.write("Lists: ", row.get("list_names_full", ""))
-                st.write("Taste matches: ", row.get("taste_matches_full", ""))
+                    lists = row.get("list_names_full", "")
+                    tastes = row.get("taste_matches_full", "")
+                    if lists:
+                        st.write("Lists:")
+                        render_reasons(lists, sep=",")
+                    if tastes:
+                        st.write("Taste matches:")
+                        render_reasons(tastes)
 
     st.download_button("Download recommendations as CSV", filtered.to_csv(index=False).encode("utf-8"), "movie_recommendations.csv", "text/csv")
 
@@ -454,6 +511,107 @@ elif page == "Evaluation":
             "This holdout test hides about 20% of rated movies, builds a profile from the rest, and checks whether the hidden movies you rated highly rise to the top. "
             "Ranking metrics are more useful than MAE for recommender quality."
         )
+
+elif page == "Curated Weeks":
+    st.subheader("Curated movie week")
+    st.write("Build an ordered watchlist around one anchor movie using your watched, rated, and watchlist history plus TMDb metadata.")
+
+    if metadata.empty:
+        st.info("Fetch TMDb metadata first so the curator can build connected movie weeks.")
+    else:
+        anchors = anchor_options(metadata, data)
+        if anchors.empty:
+            st.info("No eligible anchor movies found yet. The curator needs TMDb metadata for movies in your watched, rated, or watchlist data.")
+        else:
+            source_labels = ["Watched", "Rated", "Watchlist"]
+            control_left, control_right = st.columns([2, 1])
+            with control_left:
+                selected_sources = st.multiselect(
+                    "Anchor movie source",
+                    source_labels,
+                    default=source_labels,
+                    help="Choose which parts of your Letterboxd history can supply the anchor movie.",
+                )
+            with control_right:
+                total_movies = st.slider("Number of movies", 3, 14, 7)
+
+            filtered_anchors = anchors.copy()
+            if selected_sources:
+                selected_source_set = set(selected_sources)
+                filtered_anchors = filtered_anchors[
+                    filtered_anchors["anchor_sources"].apply(lambda values: bool(set(values) & selected_source_set))
+                ].reset_index(drop=True)
+            else:
+                filtered_anchors = filtered_anchors.iloc[0:0]
+
+            style_col, options_col = st.columns([1, 1])
+            with style_col:
+                style = st.selectbox("Curation style", CURATION_STYLES, index=0)
+            with options_col:
+                include_anchor = st.checkbox("Include anchor movie in final list", value=True)
+                allow_watched = st.checkbox("Allow watched movies", value=True)
+                allow_watchlisted = st.checkbox("Allow watchlisted movies", value=True)
+
+            if filtered_anchors.empty:
+                st.warning("No anchor movies match the selected source filters.")
+            else:
+                anchor_label = st.selectbox("Anchor movie", filtered_anchors["label"].tolist())
+                anchor_row = filtered_anchors.loc[filtered_anchors["label"] == anchor_label].iloc[0]
+
+                anchor_meta_left, anchor_meta_right = st.columns([1, 3])
+                with anchor_meta_left:
+                    if anchor_row.get("poster_url"):
+                        st.image(anchor_row.get("poster_url"), use_container_width=True)
+                with anchor_meta_right:
+                    st.caption("Anchor sources: " + (anchor_row.get("source_labels") or "Unknown"))
+                    anchor_genres = anchor_row.get("genres", []) if isinstance(anchor_row.get("genres"), list) else []
+                    anchor_moods = anchor_row.get("moods", []) if isinstance(anchor_row.get("moods"), list) else []
+                    if anchor_genres:
+                        st.caption("Genres: " + ", ".join(anchor_genres[:4]))
+                    if anchor_moods:
+                        st.caption("Moods: " + ", ".join(anchor_moods[:4]))
+                    if anchor_row.get("overview"):
+                        st.write(anchor_row.get("overview"))
+
+                try:
+                    curated = build_curated_list(
+                        anchor_movie_id=str(anchor_row["movie_id"]),
+                        data=data,
+                        metadata=metadata,
+                        total_movies=int(total_movies),
+                        style=style,
+                        allow_watched=allow_watched,
+                        allow_watchlisted=allow_watchlisted,
+                        include_anchor=include_anchor,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                    curated = pd.DataFrame()
+
+                if curated.empty:
+                    st.warning("The curator could not build a movie week from the current filters. Try allowing watched or watchlisted movies, or choose another anchor.")
+                else:
+                    if len(curated) < total_movies:
+                        st.info(f"Built {len(curated)} movies instead of {total_movies} because the filtered candidate pool ran out.")
+
+                    intensity_map = {
+                        "Context / influence": 2,
+                        "Thematic setup": 4,
+                        "Anchor movie": 7,
+                        "Director / actor connection": 5,
+                        "Intensifier": 8,
+                        "Contrast / decompression": 3,
+                        "Afterglow / reflection": 2,
+                        "Companion film": 5,
+                    }
+                    curve = curated[["day", "role"]].copy()
+                    curve["intensity"] = curve["role"].map(intensity_map).fillna(5)
+                    st.caption("Flow across the week")
+                    st.line_chart(curve.set_index("day")["intensity"], use_container_width=True)
+
+                    for _, row in curated.iterrows():
+                        with st.container(border=True):
+                            curated_week_card(row)
 
 elif page == "Database":
     st.subheader("SQLite database")
