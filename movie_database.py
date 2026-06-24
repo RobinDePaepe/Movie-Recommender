@@ -145,6 +145,17 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
                 message TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS curated_weeks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                anchor_movie_id TEXT NOT NULL,
+                anchor_name TEXT NOT NULL,
+                style TEXT NOT NULL,
+                total_movies INTEGER NOT NULL,
+                label TEXT,
+                movies_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_watched_movie ON watched_events(movie_id);
             CREATE INDEX IF NOT EXISTS idx_ratings_rating ON ratings(rating);
             CREATE INDEX IF NOT EXISTS idx_metadata_tmdb_id ON movie_metadata(tmdb_id);
@@ -394,10 +405,57 @@ def _finish_run(conn: sqlite3.Connection, run_id: int, status: str, message: str
     conn.execute("UPDATE sync_runs SET completed_at=?, status=?, message=? WHERE id=?", (utc_now(), status, message, run_id))
 
 
+def save_curated_week(
+    anchor_movie_id: str,
+    anchor_name: str,
+    style: str,
+    curated_df: pd.DataFrame,
+    label: str = "",
+    db_path: str | Path = DB_PATH,
+) -> int:
+    init_db(db_path)
+    movies_json = curated_df.to_json(orient="records", force_ascii=False)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO curated_weeks(anchor_movie_id, anchor_name, style, total_movies, label, movies_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (anchor_movie_id, anchor_name, style, len(curated_df), label or "", movies_json, utc_now()),
+        )
+        return int(cur.lastrowid)
+
+
+def load_curated_weeks(db_path: str | Path = DB_PATH) -> pd.DataFrame:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, anchor_name, style, total_movies, label, created_at FROM curated_weeks ORDER BY created_at DESC"
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["id", "anchor_name", "style", "total_movies", "label", "created_at"])
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def load_curated_week(week_id: int, db_path: str | Path = DB_PATH) -> pd.DataFrame:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT movies_json FROM curated_weeks WHERE id=?", (week_id,)).fetchone()
+    if row is None:
+        return pd.DataFrame()
+    return pd.read_json(row["movies_json"], orient="records")
+
+
 def save_feedback_to_db(movie_id_value: str, feedback_value: str, db_path: str | Path = DB_PATH) -> None:
     init_db(db_path)
     with connect(db_path) as conn:
         existing = conn.execute("SELECT movie_id FROM movies WHERE movie_id=?", (movie_id_value,)).fetchone()
         if not existing:
             conn.execute("INSERT OR IGNORE INTO movies(movie_id, name, year, created_at, updated_at) VALUES (?, ?, NULL, ?, ?)", (movie_id_value, movie_id_value, utc_now(), utc_now()))
-        conn.execute("INSERT INTO feedback(movie_id, feedback, created_at) VALUES (?, ?, ?)", (movie_id_value, feedback_value, utc_now()))
+        already = conn.execute("SELECT 1 FROM feedback WHERE movie_id=? AND feedback=?", (movie_id_value, feedback_value)).fetchone()
+        if not already:
+            conn.execute("INSERT INTO feedback(movie_id, feedback, created_at) VALUES (?, ?, ?)", (movie_id_value, feedback_value, utc_now()))
+
+
+def remove_feedback_from_db(movie_id_value: str, labels: list, db_path: str | Path = DB_PATH) -> None:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        for label in labels:
+            conn.execute("DELETE FROM feedback WHERE movie_id=? AND feedback=?", (movie_id_value, label))

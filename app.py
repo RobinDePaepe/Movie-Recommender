@@ -15,6 +15,7 @@ from recommender import (
     evaluate_historical_predictions,
     FEEDBACK_LABELS,
     load_feedback,
+    remove_feedback_from_csv,
     load_letterboxd,
     prepare_metadata,
     save_feedback,
@@ -27,10 +28,14 @@ from movie_database import (
     import_feedback_csv,
     import_letterboxd_export,
     import_tmdb_cache,
+    load_curated_week,
+    load_curated_weeks,
     load_data_from_db,
     load_feedback_from_db,
     load_metadata_from_db,
     rebuild_database,
+    save_curated_week,
+    remove_feedback_from_db,
     save_feedback_to_db,
 )
 
@@ -196,9 +201,17 @@ mode = "outside_watchlist" if mode_label == "Not on my watchlist" else "watchlis
 
 filter_values_preview = available_filter_values(pd.DataFrame())
 taste_mode = st.sidebar.selectbox("Taste mode", filter_values_preview.get("taste_modes", ["Balanced"]), index=0)
+
+with st.sidebar.expander("Scoring weights"):
+    st.caption("Drag to change how much each signal pulls the final score.")
+    content_weight = st.slider("Taste similarity", 0.0, 3.0, 1.0, 0.25, help="How strongly TF-IDF content similarity to your high-rated films affects the score.")
+    entity_weight = st.slider("Director / cast influence", 0.0, 3.0, 1.0, 0.25, help="How strongly a shared director, writer, or cast member you've rated highly affects the score.")
+    list_weight = st.slider("List signals", 0.0, 3.0, 1.0, 0.25, help="How much being on your curated lists counts.")
+score_weights = {"content": content_weight, "entity": entity_weight, "list": list_weight}
+
 page = st.sidebar.radio("Page", ["Recommendations", "Analysis", "Evaluation", "Curated Weeks", "Database", "Sync status"])
 
-recs, decade_prefs = build_recommendations(data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode)
+recs, decade_prefs = build_recommendations(data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode, score_weights=score_weights)
 
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Rated", len(data["ratings"]))
@@ -213,6 +226,13 @@ def store_feedback(movie_id: str, feedback_value: str) -> None:
         save_feedback_to_db(movie_id, feedback_value, db_path=db_path)
     else:
         save_feedback(movie_id, feedback_value)
+
+
+def remove_feedback(movie_id: str, labels: list) -> None:
+    if use_database:
+        remove_feedback_from_db(movie_id, labels, db_path=db_path)
+    else:
+        remove_feedback_from_csv(movie_id, labels)
 
 
 def poster_card(row: pd.Series, idx: int) -> None:
@@ -277,6 +297,43 @@ if page == "Recommendations":
     else:
         st.success("Using TMDb metadata for content similarity, discovery candidates, mood filters, and feedback similarity.")
 
+    # --- Anchor film ---
+    anchor_movie_id = None
+    with st.expander("Anchor on a film", expanded=False):
+        st.caption("Pick a film you love and the engine will boost candidates most similar to it.")
+        if metadata.empty:
+            st.info("Fetch TMDb metadata first to enable film anchoring.")
+        else:
+            from recommender import prepare_metadata as _prep_meta
+            anchor_pool = _prep_meta(metadata)
+            watched_ids = set(data["watched"].get("movie_id", pd.Series(dtype=str)).dropna())
+            rated_ids = set(data["ratings"].get("movie_id", pd.Series(dtype=str)).dropna())
+            anchor_pool = anchor_pool[anchor_pool["movie_id"].isin(watched_ids | rated_ids)].copy()
+            anchor_pool = anchor_pool[anchor_pool["feature_text"].str.len().gt(0)].sort_values("Name")
+            if anchor_pool.empty:
+                st.info("No watched/rated films with metadata found.")
+            else:
+                anchor_labels = ["— none —"] + [f"{r.Name} ({r.Year})" for r in anchor_pool.itertuples()]
+                anchor_choice = st.selectbox("Film to anchor on", anchor_labels)
+                if anchor_choice != "— none —":
+                    chosen_idx = anchor_labels.index(anchor_choice) - 1
+                    anchor_movie_id = str(anchor_pool.iloc[chosen_idx]["movie_id"])
+                    st.caption(f"Boosting candidates similar to: **{anchor_choice}**")
+
+    # --- Mood avoidance ---
+    ALL_MOODS = ["Tense", "Emotional", "Gritty", "Exciting", "Imaginative", "Light", "Reflective"]
+    with st.expander("Not in the mood for...", expanded=False):
+        st.caption("Temporarily penalise these moods in this session. No permanent feedback saved.")
+        avoid_moods = st.multiselect("Avoid tonight", ALL_MOODS)
+
+    # Re-run scoring if anchor or mood avoidance is active
+    if anchor_movie_id or avoid_moods:
+        from recommender import build_recommendations as _build_recs
+        recs, decade_prefs = _build_recs(
+            data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode,
+            score_weights=score_weights, anchor_movie_id=anchor_movie_id, avoid_moods=avoid_moods,
+        )
+
     filter_values = available_filter_values(recs)
     with st.expander("Filters", expanded=True):
         f1, f2, f3 = st.columns(3)
@@ -295,7 +352,9 @@ if page == "Recommendations":
         query = f6.text_input("Search title/list/metadata")
 
     filtered = apply_filters(recs, genres=selected_genres, languages=selected_languages, moods=selected_moods, decades=selected_decades, runtime_range=runtime_range, query=query)
-    st.caption(f"Showing {min(100, len(filtered))} of {len(filtered)} matching recommendations. Taste mode: {taste_mode}.")
+    anchor_note = f" | Anchor: {anchor_choice}" if anchor_movie_id else ""
+    mood_note = f" | Avoiding: {', '.join(avoid_moods)}" if avoid_moods else ""
+    st.caption(f"Showing {min(100, len(filtered))} of {len(filtered)} recommendations. Taste mode: {taste_mode}{anchor_note}{mood_note}.")
 
     view = st.radio("View", ["Poster cards", "Table"], horizontal=True)
     if view == "Poster cards":
@@ -308,7 +367,7 @@ if page == "Recommendations":
                     with col:
                         poster_card(top.iloc[idx], idx)
     else:
-        show_cols = ["Name", "Year", "score", "heuristic_score", "content_score", "feedback_score", "taste_mode_score", "why", "Letterboxd URI"]
+        show_cols = ["Name", "Year", "score", "heuristic_score", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "mood_penalty", "why", "Letterboxd URI"]
         show_cols += [c for c in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "discovered_from"] if c in filtered.columns]
         st.dataframe(filtered[show_cols].head(100), use_container_width=True, hide_index=True)
 
@@ -462,24 +521,25 @@ elif page == "Analysis":
                         current_feedback = row.get("feedback", [])
                         if not isinstance(current_feedback, list):
                             current_feedback = [current_feedback] if pd.notna(current_feedback) else []
-                        
-                        # Selectbox for feedback
-                        feedback_options = [""] + list(FEEDBACK_LABELS.keys())
-                        selected = st.selectbox(
+                        current_feedback = [f for f in current_feedback if f in FEEDBACK_LABELS]
+
+                        selected = st.multiselect(
                             "Taste feedback",
-                            options=feedback_options,
-                            format_func=lambda x: FEEDBACK_LABELS.get(x, {}).get("description", x) if x else "No feedback",
+                            options=list(FEEDBACK_LABELS.keys()),
+                            default=current_feedback,
+                            format_func=lambda x: FEEDBACK_LABELS[x]["description"],
                             key=f"feedback_{row['movie_id']}_{idx}",
-                            index=feedback_options.index(current_feedback[0]) if current_feedback else 0
                         )
-                        
-                        if selected and selected not in current_feedback:
+
+                        new_labels = [l for l in selected if l not in current_feedback]
+                        removed_labels = [l for l in current_feedback if l not in selected]
+                        if new_labels or removed_labels:
                             if st.button("Save feedback", key=f"save_{row['movie_id']}_{idx}"):
-                                save_feedback_to_db(row["movie_id"], selected) if use_database else save_feedback(row["movie_id"], selected)
-                                st.success(f"Saved '{FEEDBACK_LABELS[selected]['description']}' for {row['Name']}")
+                                for label in new_labels:
+                                    store_feedback(row["movie_id"], label)
+                                if removed_labels:
+                                    remove_feedback(row["movie_id"], removed_labels)
                                 st.rerun()
-                        elif current_feedback:
-                            st.caption(f"Current: {FEEDBACK_LABELS.get(current_feedback[0], {}).get('description', current_feedback[0])}")
 
 elif page == "Evaluation":
     st.subheader("Evaluation against historical ratings")
@@ -612,6 +672,45 @@ elif page == "Curated Weeks":
                     for _, row in curated.iterrows():
                         with st.container(border=True):
                             curated_week_card(row)
+
+                    if use_database:
+                        st.divider()
+                        save_col, _ = st.columns([2, 1])
+                        with save_col:
+                            save_label = st.text_input("Week label (optional)", placeholder="e.g. Tarkovsky deep dive", key="curated_week_label")
+                            if st.button("Save this curated week"):
+                                week_id = save_curated_week(
+                                    anchor_movie_id=str(anchor_row["movie_id"]),
+                                    anchor_name=str(anchor_row.get("Name", anchor_row["movie_id"])),
+                                    style=style,
+                                    curated_df=curated,
+                                    label=save_label,
+                                    db_path=db_path,
+                                )
+                                st.success(f"Saved as week #{week_id}.")
+
+                with st.expander("Load a saved curated week"):
+                    if not use_database:
+                        st.caption("Saved weeks require the SQLite backend. Build the database first.")
+                    else:
+                        saved_weeks = load_curated_weeks(db_path=db_path)
+                        if saved_weeks.empty:
+                            st.caption("No saved weeks yet.")
+                        else:
+                            saved_weeks["display"] = saved_weeks.apply(
+                                lambda r: f"#{r['id']} — {r['anchor_name']} ({r['style']}, {r['total_movies']} films) {r['created_at'][:10]}"
+                                + (f" — {r['label']}" if r.get("label") else ""),
+                                axis=1,
+                            )
+                            sel_week_label = st.selectbox("Select saved week", saved_weeks["display"].tolist(), key="load_curated_select")
+                            if st.button("Load selected week"):
+                                sel_id = int(saved_weeks.loc[saved_weeks["display"] == sel_week_label, "id"].iloc[0])
+                                loaded = load_curated_week(sel_id, db_path=db_path)
+                                if not loaded.empty:
+                                    st.subheader("Loaded curated week")
+                                    for _, lrow in loaded.iterrows():
+                                        with st.container(border=True):
+                                            curated_week_card(lrow)
 
 elif page == "Database":
     st.subheader("SQLite database")

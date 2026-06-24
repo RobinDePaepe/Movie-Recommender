@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
+
+logger = logging.getLogger(__name__)
 
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -137,7 +140,7 @@ def _as_list(value: Any) -> List[str]:
                 if isinstance(parsed, list):
                     return [str(v) for v in parsed if pd.notna(v)]
             except Exception:
-                pass
+                logger.debug("ast.literal_eval failed on %r, falling back to comma split", value)
         return [v.strip() for v in value.split(",") if v.strip()]
     return []
 

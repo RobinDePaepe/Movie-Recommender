@@ -4,4 +4,4 @@ streamlit
 requests
 scikit-learn
 statsmodels
-statsmodels
+pytest

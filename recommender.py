@@ -199,12 +199,24 @@ def load_feedback(path: str | Path = FEEDBACK_PATH) -> pd.DataFrame:
 def save_feedback(movie_id: str, feedback: str, path: str | Path = FEEDBACK_PATH) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_feedback(path)
+    if not existing.empty and ((existing["movie_id"] == movie_id) & (existing["feedback"] == feedback)).any():
+        return
     exists = path.exists()
     with path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["movie_id", "feedback"])
         if not exists:
             writer.writeheader()
         writer.writerow({"movie_id": movie_id, "feedback": feedback})
+
+
+def remove_feedback_from_csv(movie_id: str, labels: list, path: str | Path = FEEDBACK_PATH) -> None:
+    path = Path(path)
+    df = load_feedback(path)
+    if df.empty:
+        return
+    df = df[~((df["movie_id"] == movie_id) & (df["feedback"].isin(labels)))]
+    df.to_csv(path, index=False)
 
 
 def candidate_pool(data: Dict[str, pd.DataFrame], mode: str = "watchlist") -> pd.DataFrame:
@@ -251,7 +263,8 @@ def add_heuristic_scores(candidates: pd.DataFrame, data: Dict[str, pd.DataFrame]
     out["recency_bonus"] = pd.to_numeric(out["Year"], errors="coerce").apply(lambda y: 0.8 if pd.notna(y) and y >= 2020 else 0.0)
     out[["list_score", "list_count"]] = out[["list_score", "list_count"]].fillna(0)
     out["list_names"] = out["list_names"].fillna("")
-    out["heuristic_score"] = 3.0 + out["decade_score"] + out["liked_decade_bonus"] + out["recency_bonus"] + (out["list_score"] * LIST_SCORE_SCALE) + (out["list_count"].clip(upper=5) * LIST_COUNT_WEIGHT)
+    out["list_contribution"] = (out["list_score"] * LIST_SCORE_SCALE) + (out["list_count"].clip(upper=5) * LIST_COUNT_WEIGHT)
+    out["heuristic_score"] = 3.0 + out["decade_score"] + out["liked_decade_bonus"] + out["recency_bonus"] + out["list_contribution"]
     return out, decade_pref.sort_values("decade")
 
 
@@ -277,7 +290,13 @@ def taste_match_text(row: pd.Series, profile: Dict[str, List[str]]) -> str:
     return "; ".join(parts)
 
 
+def _rating_weight(rating: float) -> float:
+    """Convert a star rating into a similarity weight. 5★ → 1.0, 4.5★ → 0.67, 4.0★ → 0.33."""
+    return max(0.1, (float(rating) - 3.0) / 2.0)
+
+
 def add_content_similarity(candidates: pd.DataFrame, ratings: pd.DataFrame, likes: pd.DataFrame, metadata: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+    import numpy as np
     meta = prepare_metadata(metadata)
     if meta.empty:
         candidates["content_similarity"] = 0.0
@@ -289,7 +308,9 @@ def add_content_similarity(candidates: pd.DataFrame, ratings: pd.DataFrame, like
     rated["Rating"] = pd.to_numeric(rated.get("Rating"), errors="coerce")
     liked_ids = set(likes.get("movie_id", pd.Series(dtype=str)).dropna())
     positive_ids = set(rated.loc[rated["Rating"] >= 4.0, "movie_id"].dropna()) | liked_ids
+    negative_ids = set(rated.loc[rated["Rating"] <= 2.5, "movie_id"].dropna())
     positive_meta = meta[meta["movie_id"].isin(positive_ids) & meta["feature_text"].str.len().gt(0)].copy()
+    negative_meta = meta[meta["movie_id"].isin(negative_ids) & meta["feature_text"].str.len().gt(0)].copy()
     cand = candidates.merge(meta.drop(columns=["Name", "Year"], errors="ignore"), on="movie_id", how="left", suffixes=("", "_tmdb"))
     cand["metadata_found"] = cand.get("tmdb_found", False).fillna(False).astype(bool) if "tmdb_found" in cand.columns else False
     cand["feature_text"] = cand.get("feature_text", "").fillna("")
@@ -298,16 +319,98 @@ def add_content_similarity(candidates: pd.DataFrame, ratings: pd.DataFrame, like
         cand["content_score"] = 0.0
         cand["taste_matches"] = ""
         return cand, {}
-    corpus = positive_meta["feature_text"].tolist() + cand["feature_text"].tolist()
+
+    # Build a single corpus so all vectors share the same TF-IDF space
+    n_pos = len(positive_meta)
+    n_neg = len(negative_meta)
+    corpus = (
+        positive_meta["feature_text"].tolist()
+        + negative_meta["feature_text"].tolist()
+        + cand["feature_text"].tolist()
+    )
     vectorizer = TfidfVectorizer(min_df=1, ngram_range=(1, 2), max_features=12000)
     matrix = vectorizer.fit_transform(corpus)
-    sims = cosine_similarity(matrix[len(positive_meta):], matrix[:len(positive_meta)])
-    cand["content_similarity"] = sims.mean(axis=1) if sims.size else 0.0
+    pos_matrix = matrix[:n_pos]
+    neg_matrix = matrix[n_pos:n_pos + n_neg]
+    cand_matrix = matrix[n_pos + n_neg:]
+
+    # Rating-weighted positive similarity: 5★ films pull harder than 4★ films
+    rating_lookup = rated.dropna(subset=["Rating"]).set_index("movie_id")["Rating"]
+    pos_weights = np.array([
+        _rating_weight(rating_lookup[mid]) if mid in rating_lookup.index else _rating_weight(4.0)
+        for mid in positive_meta["movie_id"]
+    ])
+    pos_sims = cosine_similarity(cand_matrix, pos_matrix)
+    weight_sum = pos_weights.sum()
+    weighted_pos_sim = (pos_sims * pos_weights).sum(axis=1) / weight_sum if weight_sum > 0 else pos_sims.mean(axis=1)
+
+    # Negative penalty: penalise candidates similar to films you disliked
+    if n_neg > 0:
+        neg_sims = cosine_similarity(cand_matrix, neg_matrix)
+        neg_penalty = neg_sims.mean(axis=1) * 1.5
+    else:
+        neg_penalty = np.zeros(len(cand))
+
+    cand["content_similarity"] = weighted_pos_sim - neg_penalty
     max_sim = cand["content_similarity"].max()
     cand["content_score"] = (cand["content_similarity"] / max_sim * 4.0) if max_sim and max_sim > 0 else 0.0
     taste_profile = build_taste_profile(positive_meta)
     cand["taste_matches"] = cand.apply(lambda row: taste_match_text(row, taste_profile), axis=1)
     return cand, taste_profile
+
+
+def add_entity_affinity(candidates: pd.DataFrame, ratings: pd.DataFrame, metadata: pd.DataFrame | None) -> pd.DataFrame:
+    """Score candidates by your historical ratings for their directors, cast, and writers.
+
+    Uses a Bayesian average (pulled toward the global mean) so one lucky 5★ film
+    doesn't inflate an entity's score. Directors are weighted most heavily.
+    """
+    import numpy as np
+    out = candidates.copy()
+    out["entity_score"] = 0.0
+    if ratings.empty or metadata is None:
+        return out
+    meta = prepare_metadata(metadata)
+    if meta.empty:
+        return out
+    rated = ratings.copy()
+    rated["Rating"] = pd.to_numeric(rated.get("Rating"), errors="coerce")
+    rated = rated.dropna(subset=["Rating"])
+    rated_meta = rated.merge(meta[["movie_id", "directors", "cast", "writers"]], on="movie_id", how="inner")
+    if rated_meta.empty:
+        return out
+
+    global_mean = rated_meta["Rating"].mean()
+    PRIOR_COUNT = 3  # shrink small samples toward the mean
+    COL_WEIGHTS = {"directors": 1.5, "writers": 0.8, "cast": 0.4}
+
+    # Collect ratings per entity across all tracked columns
+    entity_ratings: Dict[str, List[float]] = {}
+    for _, row in rated_meta.iterrows():
+        for col in COL_WEIGHTS:
+            for entity in _as_list(row.get(col, [])):
+                entity_ratings.setdefault(entity, []).append(float(row["Rating"]))
+
+    # Bayesian average → deviation from global mean → weighted affinity score
+    entity_affinity: Dict[str, float] = {}
+    for entity, rs in entity_ratings.items():
+        n = len(rs)
+        bayes_avg = (sum(rs) + PRIOR_COUNT * global_mean) / (n + PRIOR_COUNT)
+        entity_affinity[entity] = (bayes_avg - global_mean) / 2.0  # normalised deviation
+
+    def calc_entity_score(row: pd.Series) -> float:
+        score = 0.0
+        for col, col_w in COL_WEIGHTS.items():
+            entities = _as_list(row.get(col, []))
+            if not entities:
+                continue
+            # Best match per column — don't sum so a large cast doesn't game the score
+            best = max((entity_affinity.get(e, 0.0) for e in entities), default=0.0)
+            score += best * col_w
+        return float(np.clip(score, -2.0, 2.0))
+
+    out["entity_score"] = out.apply(calc_entity_score, axis=1)
+    return out
 
 
 def add_feedback_similarity(candidates: pd.DataFrame, feedback: pd.DataFrame, metadata: pd.DataFrame | None) -> pd.DataFrame:
@@ -355,14 +458,18 @@ def explain_short(row: pd.Series, taste_mode: str = "Balanced") -> str:
     parts: List[str] = []
     cs = float(row.get("content_score", 0) or 0)
     fb = float(row.get("feedback_score", 0) or 0)
+    if float(row.get("anchor_score", 0) or 0) > 0.5:
+        parts.append("Matches anchor film")
     if cs >= 3.0:
-        parts.append("Strong metadata match")
+        parts.append("Strong taste match")
     elif cs > 0.75:
         parts.append("Matches taste profile")
     if abs(fb) > 0.2:
-        parts.append("Feedback: more" if fb > 0 else "Feedback: less")
+        parts.append("Taste feedback: positive" if fb > 0 else "Taste feedback: negative")
     if float(row.get("taste_mode_score", 0) or 0) > 0:
         parts.append(taste_mode)
+    if float(row.get("entity_score", 0) or 0) > 0.3:
+        parts.append("Trusted director/cast")
     if int(row.get("list_count", 0) or 0) > 0:
         parts.append(f"In {int(row.get('list_count'))} lists")
     if row.get("decade_score", 0) > 0.2:
@@ -376,10 +483,17 @@ def explain_short(row: pd.Series, taste_mode: str = "Balanced") -> str:
 
 def explain_detailed(row: pd.Series, taste_mode: str = "Balanced") -> str:
     reasons = []
+    if float(row.get("anchor_score", 0) or 0) > 0.5:
+        reasons.append("similar to your chosen anchor film")
     if row.get("content_score", 0) > 0.75:
         reasons.append("matches your high-rated taste profile: {}".format(row.get("taste_matches", "")))
     if abs(float(row.get("feedback_score", 0) or 0)) > 0.2:
-        reasons.append("adjusted by similarity to movies you marked as more/less like this")
+        reasons.append("adjusted by similarity to movies you tagged with taste feedback")
+    entity = float(row.get("entity_score", 0) or 0)
+    if entity > 0.3:
+        reasons.append("directed/written/starring someone you've consistently rated highly")
+    elif entity < -0.3:
+        reasons.append("involves someone you've rated poorly in the past")
     if float(row.get("taste_mode_score", 0) or 0) > 0:
         reasons.append(f"fits the selected taste mode: {taste_mode}")
     if row.get("list_count", 0) > 0:
@@ -395,7 +509,49 @@ def explain_detailed(row: pd.Series, taste_mode: str = "Balanced") -> str:
     return "; ".join([r for r in reasons if r]) or "solid candidate"
 
 
-def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame | None = None, mode: str = "watchlist", feedback: pd.DataFrame | None = None, taste_mode: str = "Balanced") -> Tuple[pd.DataFrame, pd.DataFrame]:
+def add_anchor_similarity(candidates: pd.DataFrame, anchor_movie_id: str | None, metadata: pd.DataFrame | None) -> pd.DataFrame:
+    """Boost candidates similar to one specific film the user picks as an anchor."""
+    out = candidates.copy()
+    out["anchor_score"] = 0.0
+    if not anchor_movie_id or metadata is None:
+        return out
+    meta = prepare_metadata(metadata)
+    if meta.empty or "feature_text" not in out.columns:
+        return out
+    anchor_rows = meta[meta["movie_id"] == anchor_movie_id]
+    if anchor_rows.empty:
+        return out
+    anchor_text = str(anchor_rows.iloc[0].get("feature_text", ""))
+    if not anchor_text:
+        return out
+    cand_texts = out["feature_text"].fillna("")
+    cand_idx = cand_texts.str.len().gt(0)
+    if not cand_idx.any():
+        return out
+    corpus = [anchor_text] + cand_texts[cand_idx].tolist()
+    matrix = TfidfVectorizer(min_df=1, ngram_range=(1, 2), max_features=8000).fit_transform(corpus)
+    sims = cosine_similarity(matrix[1:], matrix[:1]).flatten()
+    max_sim = sims.max()
+    out.loc[cand_idx, "anchor_score"] = (sims / max_sim * 2.5) if max_sim > 0 else 0.0
+    return out
+
+
+def apply_mood_avoidance(candidates: pd.DataFrame, avoid_moods: List[str], penalty: float = 1.5) -> pd.DataFrame:
+    """Subtract a score penalty for candidates whose moods overlap with the avoid list."""
+    if not avoid_moods:
+        candidates = candidates.copy()
+        candidates["mood_penalty"] = 0.0
+        return candidates
+    avoid_set = set(avoid_moods)
+    out = candidates.copy()
+    mask = out.apply(lambda row: bool(avoid_set & set(_as_list(row.get("moods", [])))), axis=1)
+    out["mood_penalty"] = 0.0
+    out.loc[mask, "mood_penalty"] = penalty
+    out["score"] = out["score"] - out["mood_penalty"]
+    return out
+
+
+def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame | None = None, mode: str = "watchlist", feedback: pd.DataFrame | None = None, taste_mode: str = "Balanced", score_weights: Dict[str, float] | None = None, anchor_movie_id: str | None = None, avoid_moods: List[str] | None = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     candidates = candidate_pool(data, mode=mode)
     meta = prepare_metadata(metadata)
     if mode == "outside_watchlist" and not meta.empty:
@@ -410,14 +566,31 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     candidates, taste_profile = add_content_similarity(candidates, data["ratings"], data["likes"], metadata if metadata is not None else pd.DataFrame())
     candidates = add_feedback_similarity(candidates, feedback if feedback is not None else pd.DataFrame(), metadata)
     candidates["taste_mode_score"] = candidates.apply(lambda row: taste_mode_score(row, taste_mode), axis=1)
-    candidates["score"] = candidates["heuristic_score"] + candidates["content_score"] + candidates["feedback_score"] + candidates["taste_mode_score"]
+    candidates = add_entity_affinity(candidates, data["ratings"], metadata)
+    candidates = add_anchor_similarity(candidates, anchor_movie_id, metadata)
+
+    weights = score_weights or {}
+    content_w = float(weights.get("content", 1.0))
+    entity_w = float(weights.get("entity", 1.0))
+    list_w = float(weights.get("list", 1.0))
+    base_heuristic = candidates["heuristic_score"] - candidates["list_contribution"]
+    candidates["score"] = (
+        base_heuristic
+        + candidates["list_contribution"] * list_w
+        + candidates["content_score"] * content_w
+        + candidates["feedback_score"]
+        + candidates["taste_mode_score"]
+        + candidates["entity_score"] * entity_w
+        + candidates["anchor_score"]
+    )
+    candidates = apply_mood_avoidance(candidates, avoid_moods or [])
     candidates["list_names_full"] = candidates.get("list_names", pd.Series(dtype=str)).fillna("").astype(str)
     candidates["taste_matches_full"] = candidates.get("taste_matches", pd.Series(dtype=str)).fillna("").astype(str)
     candidates["list_names"] = candidates["list_names_full"].apply(lambda s: s if len(s) <= 140 else s[:137] + "...")
     candidates["taste_matches"] = candidates["taste_matches_full"].apply(lambda s: s if len(s) <= 140 else s[:137] + "...")
     candidates["why_details"] = candidates.apply(lambda row: explain_detailed(row, taste_mode), axis=1)
     candidates["why"] = candidates.apply(lambda row: explain_short(row, taste_mode), axis=1)
-    cols = ["Name", "Year", "score", "heuristic_score", "content_similarity", "content_score", "feedback_score", "taste_mode_score", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
+    cols = ["Name", "Year", "score", "heuristic_score", "content_similarity", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "mood_penalty", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
     for optional_col in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "poster_url", "overview", "tmdb_vote_average", "tmdb_popularity", "discovered_from"]:
         if optional_col in candidates.columns:
             cols.append(optional_col)
