@@ -590,7 +590,7 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     candidates["taste_matches"] = candidates["taste_matches_full"].apply(lambda s: s if len(s) <= 140 else s[:137] + "...")
     candidates["why_details"] = candidates.apply(lambda row: explain_detailed(row, taste_mode), axis=1)
     candidates["why"] = candidates.apply(lambda row: explain_short(row, taste_mode), axis=1)
-    cols = ["Name", "Year", "score", "heuristic_score", "content_similarity", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "mood_penalty", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
+    cols = ["Name", "Year", "score", "heuristic_score", "list_contribution", "content_similarity", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "mood_penalty", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
     for optional_col in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "poster_url", "overview", "tmdb_vote_average", "tmdb_popularity", "discovered_from"]:
         if optional_col in candidates.columns:
             cols.append(optional_col)

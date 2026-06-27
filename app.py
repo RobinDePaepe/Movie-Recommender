@@ -14,6 +14,7 @@ from recommender import (
     ensure_export_dir,
     evaluate_historical_predictions,
     FEEDBACK_LABELS,
+    TASTE_MODES,
     load_feedback,
     remove_feedback_from_csv,
     load_letterboxd,
@@ -192,6 +193,8 @@ with st.sidebar.expander("Discover new outside-watchlist candidates"):
                 st.success(f"Discovered/cached {len(discovered)} candidate movies. Refreshing recommendations.")
                 st.rerun()
 
+ALL_MOODS = ["Tense", "Emotional", "Gritty", "Exciting", "Imaginative", "Light", "Reflective"]
+
 mode_label = st.sidebar.radio(
     "Recommendation source",
     ["My watchlist", "Not on my watchlist"],
@@ -209,7 +212,7 @@ with st.sidebar.expander("Scoring weights"):
     list_weight = st.slider("List signals", 0.0, 3.0, 1.0, 0.25, help="How much being on your curated lists counts.")
 score_weights = {"content": content_weight, "entity": entity_weight, "list": list_weight}
 
-page = st.sidebar.radio("Page", ["Recommendations", "Analysis", "Evaluation", "Curated Weeks", "Database", "Sync status"])
+page = st.sidebar.radio("Page", ["Tonight's Pick", "Recommendations", "Analysis", "Evaluation", "Curated Weeks", "Database", "Sync status"])
 
 recs, decade_prefs = build_recommendations(data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode, score_weights=score_weights)
 
@@ -290,7 +293,149 @@ def curated_week_card(row: pd.Series) -> None:
             st.link_button("Open in TMDb", tmdb_url)
 
 
-if page == "Recommendations":
+def render_score_breakdown(row: pd.Series, score_weights: dict) -> None:
+    content_w = float(score_weights.get("content", 1.0))
+    entity_w = float(score_weights.get("entity", 1.0))
+    list_w = float(score_weights.get("list", 1.0))
+
+    list_contrib = float(row.get("list_contribution", 0) or 0)
+    heuristic = float(row.get("heuristic_score", 3.0) or 3.0)
+    base_delta = heuristic - list_contrib - 3.0  # decade + recency above the 3.0 baseline
+
+    components = [
+        ("Decade & recency", base_delta),
+        ("List signals", list_contrib * list_w),
+        ("Taste similarity", float(row.get("content_score", 0) or 0) * content_w),
+        ("Feedback", float(row.get("feedback_score", 0) or 0)),
+        ("Taste mode", float(row.get("taste_mode_score", 0) or 0)),
+        ("Dir / Cast affinity", float(row.get("entity_score", 0) or 0) * entity_w),
+        ("Anchor match", float(row.get("anchor_score", 0) or 0)),
+        ("Mood penalty", -float(row.get("mood_penalty", 0) or 0)),
+    ]
+    components = [(label, val) for label, val in components if abs(val) > 0.01]
+
+    if not components:
+        st.caption("No score contribution data available.")
+        return
+
+    df_breakdown = pd.DataFrame(components, columns=["Component", "Contribution"])
+    df_breakdown["Direction"] = df_breakdown["Contribution"].apply(lambda v: "Positive" if v >= 0 else "Negative")
+    df_breakdown = df_breakdown.sort_values("Contribution")
+
+    fig = px.bar(
+        df_breakdown,
+        x="Contribution",
+        y="Component",
+        orientation="h",
+        color="Direction",
+        color_discrete_map={"Positive": "#4CAF50", "Negative": "#EF5350"},
+    )
+    fig.update_layout(
+        height=max(200, len(components) * 38 + 80),
+        margin=dict(l=0, r=20, t=10, b=20),
+        xaxis_title="Contribution to score",
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+if page == "Tonight's Pick":
+    st.subheader("What should I watch tonight?")
+    st.caption("One pick, committed. Adjust until it clicks — then hit 'This is perfect!'")
+
+    tp1, tp2 = st.columns(2)
+    with tp1:
+        tonight_taste = st.selectbox(
+            "I'm in the mood for...",
+            list(TASTE_MODES.keys()),
+            index=0,
+            key="tonight_taste",
+        )
+    with tp2:
+        _time_options = {"Any length": None, "Under 100 min": (0, 100), "Under 2 hours": (0, 120), "Under 3 hours": (0, 180)}
+        tonight_time_label = st.radio("Time available", list(_time_options.keys()), horizontal=True, key="tonight_time")
+        tonight_runtime = _time_options[tonight_time_label]
+
+    with st.expander("Not in the mood for...", expanded=False):
+        tonight_avoid = st.multiselect("Avoid these moods", ALL_MOODS, key="tonight_avoid_moods")
+
+    if "tonight_skipped" not in st.session_state:
+        st.session_state.tonight_skipped = []
+
+    tonight_recs, _ = build_recommendations(
+        data, metadata=metadata, mode=mode, feedback=feedback,
+        taste_mode=tonight_taste,
+        score_weights=score_weights,
+        avoid_moods=tonight_avoid or [],
+    )
+
+    if tonight_runtime:
+        tonight_recs = apply_filters(tonight_recs, runtime_range=tonight_runtime)
+
+    tonight_recs = tonight_recs[~tonight_recs["movie_id"].isin(st.session_state.tonight_skipped)].reset_index(drop=True)
+
+    if tonight_recs.empty:
+        st.warning("No movies match your current filters. Try adjusting mood or runtime, or reset skipped movies.")
+        if st.button("Reset skipped movies"):
+            st.session_state.tonight_skipped = []
+            st.rerun()
+    else:
+        pick = tonight_recs.iloc[0]
+
+        pc1, pc2 = st.columns([1, 2])
+        with pc1:
+            if pick.get("poster_url"):
+                st.image(str(pick["poster_url"]), use_container_width=True)
+            else:
+                st.info("No poster")
+        with pc2:
+            st.markdown(f"## {pick.get('Name', '')} ({pick.get('Year', '')})")
+            meta_parts = []
+            rt = pick.get("runtime")
+            if rt and str(rt).strip() not in ("", "nan", "<NA>"):
+                meta_parts.append(f"{rt} min")
+            genres = pick.get("genres", [])
+            if isinstance(genres, list) and genres:
+                meta_parts.append(", ".join(genres[:3]))
+            moods = pick.get("moods", [])
+            if isinstance(moods, list) and moods:
+                meta_parts.append(" · ".join(moods[:3]))
+            if meta_parts:
+                st.caption(" | ".join(meta_parts))
+            st.metric("Score", f"{float(pick.get('score', 0) or 0):.2f}")
+            with st.expander("Why this?", expanded=True):
+                render_reasons(str(pick.get("why_details") or pick.get("why", "")))
+                if pick.get("overview"):
+                    st.write(str(pick["overview"]))
+
+        with st.expander("Score breakdown", expanded=False):
+            render_score_breakdown(pick, score_weights)
+
+        st.divider()
+        ba, bb, bc = st.columns(3)
+        if ba.button("This is perfect!", use_container_width=True):
+            store_feedback(pick["movie_id"], "more_like_this")
+            st.session_state.tonight_skipped = []
+            st.success(f"Enjoy **{pick.get('Name')}**! Saved as 'more like this'.")
+        if bb.button("Give me another", use_container_width=True):
+            st.session_state.tonight_skipped.append(pick["movie_id"])
+            st.rerun()
+        if bc.button("Not for me", use_container_width=True):
+            store_feedback(pick["movie_id"], "less_like_this")
+            st.session_state.tonight_skipped.append(pick["movie_id"])
+            st.rerun()
+
+        skipped_n = len(st.session_state.tonight_skipped)
+        if skipped_n > 0:
+            sk1, sk2 = st.columns([3, 1])
+            sk1.caption(f"Skipped {skipped_n} movie(s) this session.")
+            if sk2.button("Reset skipped"):
+                st.session_state.tonight_skipped = []
+                st.rerun()
+
+elif page == "Recommendations":
     st.subheader("Recommended next watches" if mode == "watchlist" else "Recommended outside your watchlist")
     if metadata.empty:
         st.info("TMDb cache is empty. The app is using the original list/decade ranking until you fetch metadata.")
@@ -321,7 +466,6 @@ if page == "Recommendations":
                     st.caption(f"Boosting candidates similar to: **{anchor_choice}**")
 
     # --- Mood avoidance ---
-    ALL_MOODS = ["Tense", "Emotional", "Gritty", "Exciting", "Imaginative", "Light", "Reflective"]
     with st.expander("Not in the mood for...", expanded=False):
         st.caption("Temporarily penalise these moods in this session. No permanent feedback saved.")
         avoid_moods = st.multiselect("Avoid tonight", ALL_MOODS)
@@ -376,7 +520,8 @@ if page == "Recommendations":
         labels = [f"{r.Name} ({r.Year})" for r in details_frame.itertuples()]
         sel = st.selectbox("Show details for", ["- none -"] + labels)
         if sel and sel != "- none -":
-            row = details_frame.iloc[labels.index(sel)]
+            sel_idx = labels.index(sel)
+            row = details_frame.iloc[sel_idx]
             with st.expander("Why this recommendation?", expanded=True):
                 render_reasons(row["why_details"] or row["why"])
             with st.expander("Matched lists & taste matches", expanded=False):
@@ -388,6 +533,9 @@ if page == "Recommendations":
                     if tastes:
                         st.write("Taste matches:")
                         render_reasons(tastes)
+            with st.expander("Score breakdown", expanded=False):
+                full_row = filtered.head(100).iloc[sel_idx]
+                render_score_breakdown(full_row, score_weights)
 
     st.download_button("Download recommendations as CSV", filtered.to_csv(index=False).encode("utf-8"), "movie_recommendations.csv", "text/csv")
 
