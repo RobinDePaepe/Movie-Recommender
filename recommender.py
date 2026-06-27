@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import datetime
 import re
 import zipfile
 from pathlib import Path
@@ -14,6 +15,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 FEEDBACK_PATH = Path("data/feedback.csv")
 LIST_SCORE_SCALE = 0.4
 LIST_COUNT_WEIGHT = 0.15
+# The heuristic (decade/recency/liked) is a tie-breaker, not the dominant signal:
+# only its deviation from the 3.0 floor feeds the final score, damped by this weight.
+HEURISTIC_WEIGHT = 0.5
 
 TASTE_MODES: Dict[str, Dict[str, Any]] = {
     "Balanced": {"terms": [], "runtime": None},
@@ -238,9 +242,16 @@ def add_heuristic_scores(candidates: pd.DataFrame, data: Dict[str, pd.DataFrame]
     lists = data["lists"].copy()
     ratings["Rating"] = pd.to_numeric(ratings.get("Rating"), errors="coerce")
     ratings["decade"] = ratings["Year"].apply(decade)
-    decade_pref = ratings.groupby("decade")["Rating"].mean().rename("avg_user_rating").reset_index()
     global_mean = ratings["Rating"].mean() if not ratings.empty else 3.0
-    decade_pref["decade_score"] = (decade_pref["avg_user_rating"] - global_mean).fillna(0) * 1.2
+    # Bayesian-shrink per-decade means toward the global mean so one lucky 5★ film
+    # in a sparse decade doesn't inflate that decade's score (mirrors entity affinity).
+    DECADE_PRIOR_COUNT = 3
+    decade_pref = ratings.groupby("decade")["Rating"].agg(["mean", "count"]).reset_index()
+    decade_pref["avg_user_rating"] = decade_pref["mean"]
+    decade_pref["bayes"] = (
+        decade_pref["mean"] * decade_pref["count"] + global_mean * DECADE_PRIOR_COUNT
+    ) / (decade_pref["count"] + DECADE_PRIOR_COUNT)
+    decade_pref["decade_score"] = (decade_pref["bayes"] - global_mean).fillna(0) * 1.2
 
     out = candidates.copy()
     out["decade"] = out["Year"].apply(decade)
@@ -260,7 +271,12 @@ def add_heuristic_scores(candidates: pd.DataFrame, data: Dict[str, pd.DataFrame]
         out["list_names"] = ""
     liked_decades = set(likes["Year"].apply(decade)) if not likes.empty else set()
     out["liked_decade_bonus"] = out["decade"].apply(lambda d: 0.7 if d in liked_decades else 0.0)
-    out["recency_bonus"] = pd.to_numeric(out["Year"], errors="coerce").apply(lambda y: 0.8 if pd.notna(y) and y >= 2020 else 0.0)
+    current_year = datetime.date.today().year
+    # Recency bonus fades linearly from 0.8 (current year) to 0 over a 15-year window,
+    # instead of a hardcoded cliff that goes stale as years pass.
+    out["recency_bonus"] = pd.to_numeric(out["Year"], errors="coerce").apply(
+        lambda y: max(0.0, 0.8 * (1 - (current_year - y) / 15)) if pd.notna(y) else 0.0
+    )
     out[["list_score", "list_count"]] = out[["list_score", "list_count"]].fillna(0)
     out["list_names"] = out["list_names"].fillna("")
     out["list_contribution"] = (out["list_score"] * LIST_SCORE_SCALE) + (out["list_count"].clip(upper=5) * LIST_COUNT_WEIGHT)
@@ -532,7 +548,9 @@ def add_anchor_similarity(candidates: pd.DataFrame, anchor_movie_id: str | None,
     matrix = TfidfVectorizer(min_df=1, ngram_range=(1, 2), max_features=8000).fit_transform(corpus)
     sims = cosine_similarity(matrix[1:], matrix[:1]).flatten()
     max_sim = sims.max()
-    out.loc[cand_idx, "anchor_score"] = (sims / max_sim * 2.5) if max_sim > 0 else 0.0
+    # Scale to 4.0 (on par with content_score) so an explicitly chosen anchor is a
+    # primary signal rather than a weak nudge. Further tunable via the anchor weight.
+    out.loc[cand_idx, "anchor_score"] = (sims / max_sim * 4.0) if max_sim > 0 else 0.0
     return out
 
 
@@ -573,7 +591,10 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     content_w = float(weights.get("content", 1.0))
     entity_w = float(weights.get("entity", 1.0))
     list_w = float(weights.get("list", 1.0))
-    base_heuristic = candidates["heuristic_score"] - candidates["list_contribution"]
+    anchor_w = float(weights.get("anchor", 1.0))
+    # Strip the 3.0 floor and list_contribution (re-added below with its own weight) so
+    # the heuristic contributes only its deviation, damped to a tie-breaker.
+    base_heuristic = (candidates["heuristic_score"] - candidates["list_contribution"] - 3.0) * HEURISTIC_WEIGHT
     candidates["score"] = (
         base_heuristic
         + candidates["list_contribution"] * list_w
@@ -581,7 +602,7 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
         + candidates["feedback_score"]
         + candidates["taste_mode_score"]
         + candidates["entity_score"] * entity_w
-        + candidates["anchor_score"]
+        + candidates["anchor_score"] * anchor_w
     )
     candidates = apply_mood_avoidance(candidates, avoid_moods or [])
     candidates["list_names_full"] = candidates.get("list_names", pd.Series(dtype=str)).fillna("").astype(str)

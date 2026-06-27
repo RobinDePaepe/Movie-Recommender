@@ -1,3 +1,4 @@
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import os
 
@@ -5,6 +6,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import re
+
+try:
+    from dotenv import load_dotenv, set_key, find_dotenv
+    load_dotenv()
+    _DOTENV_AVAILABLE = True
+except ImportError:
+    _DOTENV_AVAILABLE = False
 
 from curator import CURATION_STYLES, anchor_options, build_curated_list
 from recommender import (
@@ -25,6 +33,7 @@ from tmdb_client import TMDbClient, discover_movies_from_favorites, enrich_movie
 from letterboxd_sync import apply_sync_overlays, sync_rss, sync_status
 from movie_database import (
     DB_PATH,
+    apply_rss_overlays_to_db,
     database_status,
     import_feedback_csv,
     import_letterboxd_export,
@@ -40,9 +49,168 @@ from movie_database import (
     save_feedback_to_db,
 )
 
-st.set_page_config(page_title="Personal Movie Recommender", layout="wide")
-st.title("Personal Movie Recommender MVP")
-st.caption("Letterboxd + TMDb recommendations with discovery, filters, feedback learning, poster cards, and evaluation.")
+st.set_page_config(page_title="Personal Movie Recommender", layout="wide", page_icon="🎬")
+
+
+def inject_theme() -> None:
+    """Inject the premium dark-cinema styling once per session."""
+    st.markdown(
+        """
+        <style>
+        /* ---- Typography ---- */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@600;700&display=swap');
+
+        html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+        /* ---- App background: subtle radial vignette ---- */
+        .stApp {
+            background:
+                radial-gradient(1200px 600px at 50% -10%, #1c1c22 0%, #0E0E10 55%) fixed;
+        }
+
+        /* ---- Hero header ---- */
+        .hero {
+            padding: 1.6rem 0 1.2rem 0;
+            border-bottom: 1px solid rgba(201,162,39,0.18);
+            margin-bottom: 1.4rem;
+        }
+        .hero-title {
+            font-family: 'Playfair Display', serif;
+            font-size: 2.5rem;
+            font-weight: 700;
+            line-height: 1.05;
+            margin: 0;
+            background: linear-gradient(90deg, #F5E6A8 0%, #C9A227 60%, #9C7A12 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .hero-sub {
+            color: #9A9AA2;
+            font-size: 0.95rem;
+            letter-spacing: 0.02em;
+            margin-top: 0.35rem;
+        }
+        .hero-mark {
+            color: #C9A227;
+            font-weight: 600;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            font-size: 0.72rem;
+        }
+
+        /* ---- Score badge ---- */
+        .score-badge {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 0.35rem;
+            background: linear-gradient(135deg, rgba(201,162,39,0.18), rgba(201,162,39,0.06));
+            border: 1px solid rgba(201,162,39,0.45);
+            border-radius: 999px;
+            padding: 0.35rem 0.95rem;
+            margin: 0.4rem 0;
+        }
+        .score-badge .num {
+            font-size: 1.35rem;
+            font-weight: 700;
+            color: #F5E6A8;
+        }
+        .score-badge .lbl {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #9A9AA2;
+        }
+
+        /* ---- Metadata chips ---- */
+        .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0; }
+        .chip {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 6px;
+            padding: 0.18rem 0.55rem;
+            font-size: 0.74rem;
+            color: #CFCFD6;
+            white-space: nowrap;
+        }
+        .chip.accent { border-color: rgba(201,162,39,0.4); color: #E6CF7A; }
+
+        /* ---- Poster images: rounded with depth + hover lift ---- */
+        [data-testid="stImage"] img {
+            border-radius: 10px;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.55);
+            transition: transform 0.18s ease, box-shadow 0.18s ease;
+        }
+        [data-testid="stImage"] img:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 12px 30px rgba(0,0,0,0.7), 0 0 0 1px rgba(201,162,39,0.35);
+        }
+
+        /* ---- Buttons ---- */
+        .stButton > button {
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.04);
+            font-weight: 500;
+            transition: all 0.16s ease;
+        }
+        .stButton > button:hover {
+            border-color: rgba(201,162,39,0.6);
+            color: #F5E6A8;
+            background: rgba(201,162,39,0.10);
+        }
+
+        /* ---- Metric cards ---- */
+        [data-testid="stMetric"] {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 10px;
+            padding: 0.7rem 0.9rem;
+        }
+
+        /* ---- Expanders ---- */
+        [data-testid="stExpander"] {
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 10px;
+            background: rgba(255,255,255,0.02);
+        }
+
+        /* ---- Headings ---- */
+        h1, h2, h3 { letter-spacing: -0.01em; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_hero() -> None:
+    st.markdown(
+        """
+        <div class="hero">
+            <div class="hero-mark">🎬 Your Personal Cinema</div>
+            <h1 class="hero-title">Movie Recommender</h1>
+            <div class="hero-sub">Letterboxd + TMDb · taste-aware picks, curated weeks, and discovery tuned to you.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def score_badge_html(score: float) -> str:
+    return (
+        f'<div class="score-badge"><span class="num">{score:.2f}</span>'
+        f'<span class="lbl">match score</span></div>'
+    )
+
+
+def chips_html(items: list, accent: bool = False) -> str:
+    cls = "chip accent" if accent else "chip"
+    spans = "".join(f'<span class="{cls}">{str(x)}</span>' for x in items if str(x).strip())
+    return f'<div class="chips">{spans}</div>' if spans else ""
+
+
+inject_theme()
+render_hero()
 
 
 def render_reasons(text: str, sep: str = ";") -> None:
@@ -72,6 +240,36 @@ if not export_zip.exists():
 db_path = Path("data/movie_recommender.sqlite")
 use_database = db_path.exists()
 
+# --- Startup auto-sync ---
+# Runs once per session if LETTERBOXD_USERNAME is set and last sync was > 1 hour ago.
+# Updates overlay CSVs (and SQLite if active) before data loads, so the session starts fresh.
+if "auto_synced_this_session" not in st.session_state:
+    st.session_state.auto_synced_this_session = False
+
+_lb_auto_user = os.getenv("LETTERBOXD_USERNAME", "")
+_auto_new_events = 0
+if not st.session_state.auto_synced_this_session and _lb_auto_user:
+    _sync_state = sync_status()
+    _last_sync = _sync_state.get("last_sync_at", "")
+    _needs_sync = True
+    if _last_sync:
+        try:
+            _last_dt = datetime.fromisoformat(_last_sync)
+            if _last_dt.tzinfo is None:
+                _last_dt = _last_dt.replace(tzinfo=timezone.utc)
+            _needs_sync = (datetime.now(timezone.utc) - _last_dt) > timedelta(hours=1)
+        except Exception:
+            pass
+    if _needs_sync:
+        try:
+            _auto_result = sync_rss(_lb_auto_user)
+            _auto_new_events = _auto_result.get("new_events", 0)
+            if use_database:
+                apply_rss_overlays_to_db(db_path=db_path)
+        except Exception:
+            pass
+    st.session_state.auto_synced_this_session = True
+
 if use_database:
     data = load_data_from_db(db_path)
 else:
@@ -88,6 +286,9 @@ movie_frames = [
 if not data["lists"].empty:
     movie_frames.append(data["lists"][["Name", "Year"]])
 all_movies = pd.concat(movie_frames, ignore_index=True).drop_duplicates()
+
+if _auto_new_events > 0:
+    st.toast(f"Auto-synced Letterboxd: {_auto_new_events} new events added.")
 
 st.sidebar.header("TMDb metadata")
 api_key_input = st.sidebar.text_input(
@@ -135,9 +336,24 @@ with st.sidebar.expander("Sync recent activity from RSS"):
         if not lb_username:
             st.error("Add your Letterboxd username or RSS URL first.")
         else:
-            with st.spinner("Fetching Letterboxd RSS and updating local overlays..."):
+            with st.spinner("Fetching Letterboxd RSS..."):
                 result = sync_rss(lb_username)
-            st.success(f"Fetched {result.get('fetched_events', 0)} events; added {result.get('new_events', 0)} new events.")
+            if use_database:
+                with st.spinner("Applying synced events to database..."):
+                    apply_rss_overlays_to_db(db_path=db_path)
+            new_ev = result.get("new_events", 0)
+            st.success(
+                f"Fetched {result.get('fetched_events', 0)} events; "
+                f"{new_ev} new."
+                + (" Database updated." if use_database else "")
+            )
+            # Persist username to .env so auto-sync works next session.
+            if _DOTENV_AVAILABLE and lb_username != os.getenv("LETTERBOXD_USERNAME", ""):
+                try:
+                    _env_file = find_dotenv(usecwd=True) or ".env"
+                    set_key(_env_file, "LETTERBOXD_USERNAME", lb_username)
+                except Exception:
+                    pass
             st.rerun()
 
 with st.sidebar.expander("Replace with fresh Letterboxd export"):
@@ -150,7 +366,12 @@ with st.sidebar.expander("Replace with fresh Letterboxd export"):
         if Path("data/letterboxd").exists():
             import shutil
             shutil.rmtree(Path("data/letterboxd"))
-        st.success("Installed latest Letterboxd export. Refreshing data.")
+        if use_database:
+            with st.spinner("Rebuilding database from new export..."):
+                rebuild_database(export_zip=export_zip, cache_path=cache_path, db_path=db_path)
+            st.success("Installed new Letterboxd export and rebuilt database.")
+        else:
+            st.success("Installed latest Letterboxd export. Refreshing data.")
         st.rerun()
 
 with st.sidebar.expander("Enrich known Letterboxd movies"):
@@ -210,7 +431,8 @@ with st.sidebar.expander("Scoring weights"):
     content_weight = st.slider("Taste similarity", 0.0, 3.0, 1.0, 0.25, help="How strongly TF-IDF content similarity to your high-rated films affects the score.")
     entity_weight = st.slider("Director / cast influence", 0.0, 3.0, 1.0, 0.25, help="How strongly a shared director, writer, or cast member you've rated highly affects the score.")
     list_weight = st.slider("List signals", 0.0, 3.0, 1.0, 0.25, help="How much being on your curated lists counts.")
-score_weights = {"content": content_weight, "entity": entity_weight, "list": list_weight}
+    anchor_weight = st.slider("Anchor influence", 0.0, 3.0, 1.0, 0.25, help="How strongly the film you anchor on (Recommendations page) pulls similar candidates up.")
+score_weights = {"content": content_weight, "entity": entity_weight, "list": list_weight, "anchor": anchor_weight}
 
 page = st.sidebar.radio("Page", ["Tonight's Pick", "Recommendations", "Analysis", "Evaluation", "Curated Weeks", "Database", "Sync status"])
 
@@ -240,17 +462,26 @@ def remove_feedback(movie_id: str, labels: list) -> None:
 
 def poster_card(row: pd.Series, idx: int) -> None:
     title = f"{row.get('Name', '')} ({row.get('Year', '')})"
-    if row.get("poster_url"):
-        st.image(row["poster_url"], use_container_width=True)
+    _pu = row.get("poster_url")
+    if pd.notna(_pu) and str(_pu).strip():
+        st.image(str(_pu).strip(), use_container_width=True)
     else:
         st.info("No poster")
     st.markdown(f"**{title}**")
-    st.caption(f"Score {float(row.get('score', 0) or 0):.2f} | {row.get('why', '')}")
+    st.markdown(score_badge_html(float(row.get("score", 0) or 0)), unsafe_allow_html=True)
     rt = row.get("runtime", "")
-    moods = ", ".join(row.get("moods", [])) if isinstance(row.get("moods"), list) else str(row.get("moods", ""))
-    genres = ", ".join(row.get("genres", [])) if isinstance(row.get("genres"), list) else str(row.get("genres", ""))
-    if rt or moods or genres:
-        st.caption(" | ".join([x for x in [f"{rt} min" if rt else "", moods, genres] if x]))
+    chip_items = [f"{rt} min"] if rt else []
+    genres = row.get("genres", [])
+    if isinstance(genres, list):
+        chip_items.extend(genres[:3])
+    mood_items = row.get("moods", [])
+    mood_items = mood_items[:2] if isinstance(mood_items, list) else []
+    if chip_items:
+        st.markdown(chips_html(chip_items), unsafe_allow_html=True)
+    if mood_items:
+        st.markdown(chips_html(mood_items, accent=True), unsafe_allow_html=True)
+    if row.get("why"):
+        st.caption(str(row.get("why")))
     with st.expander("Why?"):
         render_reasons(row.get("why_details", row.get("why", "")))
         if row.get("overview"):
@@ -271,8 +502,9 @@ def curated_week_card(row: pd.Series) -> None:
 
     left, right = st.columns([1, 4])
     with left:
-        if row.get("poster_url"):
-            st.image(row["poster_url"], use_container_width=True)
+        _pu = row.get("poster_url")
+        if pd.notna(_pu) and str(_pu).strip():
+            st.image(str(_pu).strip(), use_container_width=True)
         else:
             st.info("No poster")
     with right:
@@ -386,25 +618,28 @@ if page == "Tonight's Pick":
 
         pc1, pc2 = st.columns([1, 2])
         with pc1:
-            if pick.get("poster_url"):
-                st.image(str(pick["poster_url"]), use_container_width=True)
+            _pu = pick.get("poster_url")
+            if pd.notna(_pu) and str(_pu).strip():
+                st.image(str(_pu).strip(), use_container_width=True)
             else:
                 st.info("No poster")
         with pc2:
             st.markdown(f"## {pick.get('Name', '')} ({pick.get('Year', '')})")
-            meta_parts = []
+            chip_items = []
             rt = pick.get("runtime")
             if rt and str(rt).strip() not in ("", "nan", "<NA>"):
-                meta_parts.append(f"{rt} min")
+                chip_items.append(f"{rt} min")
             genres = pick.get("genres", [])
-            if isinstance(genres, list) and genres:
-                meta_parts.append(", ".join(genres[:3]))
-            moods = pick.get("moods", [])
-            if isinstance(moods, list) and moods:
-                meta_parts.append(" · ".join(moods[:3]))
-            if meta_parts:
-                st.caption(" | ".join(meta_parts))
-            st.metric("Score", f"{float(pick.get('score', 0) or 0):.2f}")
+            if isinstance(genres, list):
+                chip_items.extend(genres[:3])
+            mood_items = pick.get("moods", [])
+            mood_items = mood_items[:3] if isinstance(mood_items, list) else []
+            html = score_badge_html(float(pick.get("score", 0) or 0))
+            if chip_items:
+                html += chips_html(chip_items)
+            if mood_items:
+                html += chips_html(mood_items, accent=True)
+            st.markdown(html, unsafe_allow_html=True)
             with st.expander("Why this?", expanded=True):
                 render_reasons(str(pick.get("why_details") or pick.get("why", "")))
                 if pick.get("overview"):
@@ -651,8 +886,9 @@ elif page == "Analysis":
                 with st.container():
                     col1, col2, col3 = st.columns([1, 3, 2])
                     with col1:
-                        if pd.notna(row.get("poster_url")):
-                            st.image(row["poster_url"], width=80)
+                        _poster = row.get("poster_url")
+                        if pd.notna(_poster) and str(_poster).strip():
+                            st.image(str(_poster).strip(), width=80)
                         else:
                             st.write("📽️")
                     with col2:
@@ -660,7 +896,7 @@ elif page == "Analysis":
                         if pd.notna(row.get("overview")):
                             st.caption(row["overview"][:200] + "..." if len(str(row["overview"])) > 200 else str(row["overview"]))
                         genres = row.get("genres", [])
-                        if genres:
+                        if isinstance(genres, list) and genres:
                             st.caption("Genres: " + ", ".join(genres[:3]))
                         rating = row.get("Rating")
                         if pd.notna(rating):
@@ -768,8 +1004,9 @@ elif page == "Curated Weeks":
 
                 anchor_meta_left, anchor_meta_right = st.columns([1, 3])
                 with anchor_meta_left:
-                    if anchor_row.get("poster_url"):
-                        st.image(anchor_row.get("poster_url"), use_container_width=True)
+                    _pu = anchor_row.get("poster_url")
+                    if pd.notna(_pu) and str(_pu).strip():
+                        st.image(str(_pu).strip(), use_container_width=True)
                 with anchor_meta_right:
                     st.caption("Anchor sources: " + (anchor_row.get("source_labels") or "Unknown"))
                     anchor_genres = anchor_row.get("genres", []) if isinstance(anchor_row.get("genres"), list) else []

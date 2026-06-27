@@ -285,6 +285,79 @@ def import_tmdb_cache(cache_path: str | Path = "data/tmdb_cache.json", db_path: 
     return imported
 
 
+def apply_rss_overlays_to_db(sync_dir: str | Path = "data/sync", db_path: str | Path = DB_PATH) -> Dict[str, int]:
+    """Upsert RSS overlay CSVs into the SQLite database.
+
+    Applies ratings_overlay.csv (with rating-history tracking) and diary_overlay.csv
+    (individual watch events, deduped by event_id).  Call this after sync_rss() so that
+    SQLite-mode data stays in sync without a full rebuild.
+    """
+    sync_dir = Path(sync_dir)
+    counts: Dict[str, int] = {"ratings_updated": 0, "diary_added": 0}
+
+    if not sync_dir.exists():
+        return counts
+
+    def _read(name: str) -> pd.DataFrame:
+        p = sync_dir / name
+        return pd.read_csv(p) if p.exists() else pd.DataFrame()
+
+    init_db(db_path)
+    with connect(db_path) as conn:
+        run_id = _start_run(conn, "rss_overlay")
+        try:
+            # Ratings overlay — upsert latest rating per movie, track changes.
+            for _, row in _read("ratings_overlay.csv").iterrows():
+                name = str(row.get("Name", "")).strip()
+                if not name:
+                    continue
+                mid = upsert_movie(conn, name, row.get("Year"), uri=str(row.get("Letterboxd URI", "")))
+                new_rating = pd.to_numeric(row.get("Rating"), errors="coerce")
+                if pd.isna(new_rating):
+                    continue
+                old = conn.execute("SELECT rating FROM ratings WHERE movie_id=?", (mid,)).fetchone()
+                if old is not None and old["rating"] != float(new_rating):
+                    conn.execute(
+                        "INSERT INTO rating_history(movie_id, old_rating, new_rating, changed_at, source) VALUES (?, ?, ?, ?, ?)",
+                        (mid, old["rating"], float(new_rating), utc_now(), "letterboxd_rss"),
+                    )
+                conn.execute(
+                    "INSERT INTO ratings(movie_id, rating, rated_at, source, updated_at) VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(movie_id) DO UPDATE SET"
+                    "   rating=excluded.rating, source=excluded.source, updated_at=excluded.updated_at",
+                    (mid, float(new_rating), str(row.get("synced_at", "")), "letterboxd_rss", utc_now()),
+                )
+                counts["ratings_updated"] += 1
+
+            # Diary overlay — insert individual watch events; event_id prevents duplicates.
+            for _, row in _read("diary_overlay.csv").iterrows():
+                name = str(row.get("Name", "")).strip()
+                if not name:
+                    continue
+                mid = upsert_movie(conn, name, row.get("Year"), uri=str(row.get("Letterboxd URI", "")))
+                rating = pd.to_numeric(row.get("Rating"), errors="coerce")
+                rewatch = str(row.get("Rewatch", "")).lower() in {"yes", "true", "1"}
+                event_id = str(row.get("event_id", f"rss:{mid}:{row.get('Watched Date', '')}"))
+                conn.execute(
+                    "INSERT OR IGNORE INTO watched_events"
+                    "(movie_id, watched_date, rewatch, rating, review_text, source, source_event_id, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        mid, str(row.get("Watched Date", "")), int(rewatch),
+                        None if pd.isna(rating) else float(rating),
+                        "", "letterboxd_rss", event_id, utc_now(),
+                    ),
+                )
+                counts["diary_added"] += 1
+
+            _finish_run(conn, run_id, "ok", json.dumps(counts))
+        except Exception as exc:
+            _finish_run(conn, run_id, "error", str(exc))
+            raise
+
+    return counts
+
+
 def import_feedback_csv(path: str | Path = "data/feedback.csv", db_path: str | Path = DB_PATH) -> int:
     init_db(db_path)
     fb = load_feedback(path)
