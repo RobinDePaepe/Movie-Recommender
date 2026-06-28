@@ -5,3 +5,8 @@ requests
 scikit-learn
 statsmodels
 pytest
+
+# Optional: enables *semantic* theme similarity (sentence-transformer embeddings of
+# keywords + overview). Without it, theme similarity falls back to TF-IDF over the same
+# text. Pulls in torch, so it is intentionally not a hard dependency.
+# pip install sentence-transformers

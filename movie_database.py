@@ -133,6 +133,7 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 movie_id TEXT REFERENCES movies(movie_id) ON DELETE CASCADE,
                 feedback TEXT NOT NULL,
+                scope TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -161,6 +162,10 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_metadata_tmdb_id ON movie_metadata(tmdb_id);
             """
         )
+        # Migration: add feedback.scope to databases created before scope tracking existed.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(feedback)").fetchall()}
+        if "scope" not in cols:
+            conn.execute("ALTER TABLE feedback ADD COLUMN scope TEXT")
 
 
 def _safe_year(year: Any) -> Optional[int]:
@@ -373,7 +378,8 @@ def import_feedback_csv(path: str | Path = "data/feedback.csv", db_path: str | P
             if not existing:
                 name_year = str(row["movie_id"])
                 conn.execute("INSERT OR IGNORE INTO movies(movie_id, name, year, created_at, updated_at) VALUES (?, ?, NULL, ?, ?)", (name_year, name_year, utc_now(), utc_now()))
-            conn.execute("INSERT INTO feedback(movie_id, feedback, created_at) VALUES (?, ?, ?)", (row["movie_id"], row.get("feedback", ""), utc_now()))
+            scope = row.get("scope") if "scope" in fb.columns and pd.notna(row.get("scope")) else "recommendation"
+            conn.execute("INSERT INTO feedback(movie_id, feedback, scope, created_at) VALUES (?, ?, ?, ?)", (row["movie_id"], row.get("feedback", ""), scope, utc_now()))
             count += 1
     return count
 
@@ -416,7 +422,7 @@ def load_metadata_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:
 def load_feedback_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:
     init_db(db_path)
     with connect(db_path) as conn:
-        return pd.read_sql_query("SELECT movie_id, feedback, created_at FROM feedback", conn)
+        return pd.read_sql_query("SELECT movie_id, feedback, COALESCE(scope, 'recommendation') AS scope, created_at FROM feedback", conn)
 
 
 def database_status(db_path: str | Path = DB_PATH) -> Dict[str, Any]:
@@ -516,7 +522,7 @@ def load_curated_week(week_id: int, db_path: str | Path = DB_PATH) -> pd.DataFra
     return pd.read_json(row["movies_json"], orient="records")
 
 
-def save_feedback_to_db(movie_id_value: str, feedback_value: str, db_path: str | Path = DB_PATH) -> None:
+def save_feedback_to_db(movie_id_value: str, feedback_value: str, scope: str = "recommendation", db_path: str | Path = DB_PATH) -> None:
     init_db(db_path)
     with connect(db_path) as conn:
         existing = conn.execute("SELECT movie_id FROM movies WHERE movie_id=?", (movie_id_value,)).fetchone()
@@ -524,7 +530,7 @@ def save_feedback_to_db(movie_id_value: str, feedback_value: str, db_path: str |
             conn.execute("INSERT OR IGNORE INTO movies(movie_id, name, year, created_at, updated_at) VALUES (?, ?, NULL, ?, ?)", (movie_id_value, movie_id_value, utc_now(), utc_now()))
         already = conn.execute("SELECT 1 FROM feedback WHERE movie_id=? AND feedback=?", (movie_id_value, feedback_value)).fetchone()
         if not already:
-            conn.execute("INSERT INTO feedback(movie_id, feedback, created_at) VALUES (?, ?, ?)", (movie_id_value, feedback_value, utc_now()))
+            conn.execute("INSERT INTO feedback(movie_id, feedback, scope, created_at) VALUES (?, ?, ?, ?)", (movie_id_value, feedback_value, scope, utc_now()))
 
 
 def remove_feedback_from_db(movie_id_value: str, labels: list, db_path: str | Path = DB_PATH) -> None:

@@ -11,6 +11,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from recommender import prepare_metadata
+import theme_similarity
 
 
 DEFAULT_WEEK_SIZE = 7
@@ -52,6 +53,7 @@ STYLE_WEIGHTS = {
         "cast": 0.8,
         "genres": 1.2,
         "keywords": 1.5,
+        "theme_similarity": 1.5,
         "moods": 1.1,
         "decade": 0.5,
         "country": 0.4,
@@ -63,6 +65,7 @@ STYLE_WEIGHTS = {
         "cast": 1.0,
         "genres": 0.8,
         "keywords": 0.8,
+        "theme_similarity": 0.8,
         "moods": 0.7,
         "decade": 0.4,
         "country": 0.3,
@@ -74,6 +77,7 @@ STYLE_WEIGHTS = {
         "cast": 0.5,
         "genres": 1.0,
         "keywords": 3.0,
+        "theme_similarity": 3.5,
         "moods": 1.2,
         "decade": 0.3,
         "country": 0.2,
@@ -85,6 +89,7 @@ STYLE_WEIGHTS = {
         "cast": 0.4,
         "genres": 1.2,
         "keywords": 1.4,
+        "theme_similarity": 1.6,
         "moods": 3.0,
         "decade": 0.4,
         "country": 0.3,
@@ -96,6 +101,7 @@ STYLE_WEIGHTS = {
         "cast": 0.5,
         "genres": 1.0,
         "keywords": 1.4,
+        "theme_similarity": 1.4,
         "moods": 0.8,
         "decade": 1.7,
         "country": 1.0,
@@ -107,6 +113,7 @@ STYLE_WEIGHTS = {
         "cast": 0.6,
         "genres": 1.0,
         "keywords": 1.1,
+        "theme_similarity": 1.1,
         "moods": 1.1,
         "decade": 0.4,
         "country": 0.3,
@@ -238,6 +245,11 @@ def _score_candidates(anchor: pd.Series, candidates: pd.DataFrame, config: Curat
     weights = STYLE_WEIGHTS.get(config.style, STYLE_WEIGHTS["Balanced"])
     out = candidates.copy()
     out["anchor_similarity"] = _similarity_to_anchor(anchor, out)
+    # Conceptual/thematic similarity (keywords + overview, semantic when available),
+    # complementing the literal keyword overlap below.
+    anchor_id = str(anchor.get("movie_id"))
+    theme_meta = pd.concat([out, anchor.to_frame().T], ignore_index=True)
+    out["theme_sim"] = theme_similarity.theme_anchor_scores(out, anchor_id, theme_meta).to_numpy()
 
     anchor_decade = _decade(anchor.get("Year"))
     anchor_runtime = _safe_runtime(anchor.get("runtime"))
@@ -262,6 +274,7 @@ def _score_candidates(anchor: pd.Series, candidates: pd.DataFrame, config: Curat
 
         score = (
             row.get("anchor_similarity", 0) * weights["similarity"] * 5
+            + row.get("theme_sim", 0) * weights.get("theme_similarity", 0)
             + min(director_n, 2) * weights["director"]
             + min(cast_n, 3) * weights["cast"]
             + min(genre_n, 3) * weights["genres"]

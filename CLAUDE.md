@@ -13,7 +13,8 @@ streamlit run app.py
 **Install dependencies:**
 ```bash
 pip install -r requirements.txt
-pip install statsmodels  # optional: enables trendline on evaluation chart
+pip install statsmodels            # optional: enables trendline on evaluation chart
+pip install sentence-transformers  # optional: enables semantic theme similarity (else TF-IDF fallback)
 ```
 
 **Run tests:**
@@ -42,11 +43,14 @@ The app is a single-page Streamlit UI (`app.py`) that delegates all logic to the
 3. `add_content_similarity()` — TF-IDF cosine similarity over `feature_text` (genres×4, directors×5, cast×2, keywords×3, overview) against high-rated films; negative-rated films subtract a penalty
 4. `add_feedback_similarity()` — TF-IDF similarity to films you've tagged with `FEEDBACK_LABELS` feedback
 5. `add_entity_affinity()` — Bayesian-average rating per director/writer/cast entity
-6. `add_anchor_similarity()` — optional boost toward one user-picked anchor film (scaled to `4.0`, on par with content, so an explicit anchor is a primary signal)
-7. `apply_mood_avoidance()` — session-only mood penalty
-8. Final `score` = weighted sum of all components; weights are user-tunable in the sidebar (`content`, `entity`, `list`, `anchor`). The heuristic is damped to a tie-breaker: only its deviation from the `3.0` floor feeds the score, scaled by `HEURISTIC_WEIGHT`.
+6. `add_anchor_similarity()` — optional boost toward one user-picked anchor film, now **theme-aware** (delegates to `theme_similarity`); scaled to `4.0`, on par with content, so an explicit anchor is a primary signal
+7. `add_theme_similarity()` — standalone *conceptual/thematic* channel (`theme_score`): closeness of keywords + overview to your high-rated films, isolated from genre/director/cast. Delegates to `theme_similarity`
+8. `apply_mood_avoidance()` — session-only mood penalty
+9. Final `score` = weighted sum of all components; weights are user-tunable in the sidebar (`content`, `theme`, `entity`, `list`, `anchor`). The heuristic is damped to a tie-breaker: only its deviation from the `3.0` floor feeds the score, scaled by `HEURISTIC_WEIGHT`. **Anchor-focus** (`anchor_focus`, default on): when a film is anchored, `content`/`theme`/`entity` weights are scaled by `ANCHOR_FOCUS_SCALE` so the anchor leads instead of being cancelled by global taste.
 
-**`curator.py`** — builds ordered "curated weeks" around an anchor film. Assigns narrative roles (`Context / influence`, `Thematic setup`, `Anchor movie`, etc.) to slots, then scores and picks candidates per role using `STYLE_WEIGHTS` (Balanced, Director-focused, Theme-focused, Vibe-focused, etc.).
+**`theme_similarity.py`** — shared "what a film is about" engine used by both `recommender.py` and `curator.py`. `theme_text()` = keywords + overview only. Backend is local sentence-transformer embeddings (`all-MiniLM-L6-v2`) cached to `data/theme_embeddings.pkl` (sha1-invalidated), with an automatic TF-IDF fallback when `sentence-transformers` isn't installed. Exposes `theme_anchor_scores()` (vs one anchor) and `theme_taste_scores()` (vs your high-rated set), both robust-scaled to ~0–4.
+
+**`curator.py`** — builds ordered "curated weeks" around an anchor film. Assigns narrative roles (`Context / influence`, `Thematic setup`, `Anchor movie`, etc.) to slots, then scores and picks candidates per role using `STYLE_WEIGHTS` (Balanced, Director-focused, Theme-focused, Vibe-focused, etc.). Each style also carries a `theme_similarity` weight (highest in Theme-focused) that blends in the `theme_similarity` engine's semantic theme score alongside the literal keyword overlap.
 
 **`movie_database.py`** — SQLite backend (`data/movie_recommender.sqlite`). The app auto-detects whether the DB exists and uses it instead of CSV/JSON files. The DB must be rebuilt via the sidebar button after new imports. All tables are defined in `init_db()`. JSON list columns (genres, cast, etc.) are stored as JSON strings and deserialized on load. `apply_rss_overlays_to_db()` upserts the RSS sync overlays (ratings with rating-history tracking, diary events deduped by `event_id`) into SQLite without a full rebuild — call it after `sync_rss()` so DB-mode data stays current.
 

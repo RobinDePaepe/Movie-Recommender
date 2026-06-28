@@ -12,12 +12,17 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import mean_absolute_error
 from sklearn.metrics.pairwise import cosine_similarity
 
+import theme_similarity
+
 FEEDBACK_PATH = Path("data/feedback.csv")
 LIST_SCORE_SCALE = 0.4
 LIST_COUNT_WEIGHT = 0.15
 # The heuristic (decade/recency/liked) is a tie-breaker, not the dominant signal:
 # only its deviation from the 3.0 floor feeds the final score, damped by this weight.
 HEURISTIC_WEIGHT = 0.5
+# When a film is anchored, attenuate the personal-taste signals so the anchor leads
+# (otherwise global taste cancels a concept-cousin anchor — the Moon/Primer problem).
+ANCHOR_FOCUS_SCALE = 0.4
 
 TASTE_MODES: Dict[str, Dict[str, Any]] = {
     "Balanced": {"terms": [], "runtime": None},
@@ -29,16 +34,45 @@ TASTE_MODES: Dict[str, Dict[str, Any]] = {
     "High confidence": {"terms": [], "runtime": None, "min_metadata": True},
 }
 
-# Feedback labels for taste tuning
+# Feedback labels for taste tuning. Weights scale the content-similarity channel, so the
+# sign steers recommendations toward (+) or away from (-) films with similar feature_text.
+# Keys "more_like_this"/"less_like_this" are preserved for back-compat with saved feedback.
 FEEDBACK_LABELS = {
+    # Positive — pull toward similar films
+    "all_time_favorite": {"weight": 2.5, "description": "All-time favorite"},
+    "masterpiece": {"weight": 2.2, "description": "Masterpiece (rarely rewatched)"},
+    "great_film": {"weight": 1.8, "description": "Great (rarely rewatched)"},
+    "rewatchable": {"weight": 2.0, "description": "Rewatchable"},
     "more_like_this": {"weight": 1.5, "description": "More like this"},
+    "pleasant_surprise": {"weight": 1.3, "description": "Pleasant surprise"},
+    "comfort_watch": {"weight": 1.2, "description": "Comfort watch"},
+    "guilty_pleasure": {"weight": 0.8, "description": "Guilty pleasure"},
+    # Neutral — respect, but little or no pull
+    "interesting_but_not_more": {"weight": 0.0, "description": "Interesting, but not more"},
+    "mood_dependent": {"weight": 0.0, "description": "Mood-dependent"},
+    "admire_not_love": {"weight": -0.3, "description": "Admire, don't love"},
+    # Negative — push away from similar films
+    "one_and_done": {"weight": -0.8, "description": "One and done"},
+    "overrated_for_me": {"weight": -1.2, "description": "Overrated for me"},
+    "high_quality_not_my_taste": {"weight": -1.5, "description": "High quality, not my taste"},
     "less_like_this": {"weight": -2.0, "description": "Less like this"},
-    "rewatchable": {"weight": 1.0, "description": "Rewatchable"},
-    "one_and_done": {"weight": -0.5, "description": "One and done"},
-    "interesting_but_not_more": {"weight": 0.3, "description": "Interesting but not more"},
-    "high_quality_not_my_taste": {"weight": -0.8, "description": "High quality, not my taste"},
-    "guilty_pleasure": {"weight": 0.7, "description": "Guilty pleasure"},
+    "actively_disliked": {"weight": -2.5, "description": "Actively disliked"},
 }
+
+# Deliberate watched-movie tuning is a stronger signal than passive feedback clicked from a
+# recommendation. The multiplier scales each label's weight by where the feedback came from.
+SCOPE_WEIGHTS = {
+    "watched_tuning": 1.5,
+    "recommendation": 1.0,
+    "evaluation": 1.0,
+}
+
+
+def _scope_multiplier(feedback: pd.DataFrame) -> pd.Series:
+    """Per-row scope multiplier; missing/unknown scopes default to 'recommendation' (1.0)."""
+    if "scope" not in feedback.columns:
+        return pd.Series(1.0, index=feedback.index)
+    return feedback["scope"].map(SCOPE_WEIGHTS).fillna(SCOPE_WEIGHTS["recommendation"])
 
 
 def _read_csv(path: Path, **kwargs) -> pd.DataFrame:
@@ -196,11 +230,16 @@ def prepare_metadata(metadata: pd.DataFrame | None) -> pd.DataFrame:
 def load_feedback(path: str | Path = FEEDBACK_PATH) -> pd.DataFrame:
     path = Path(path)
     if not path.exists():
-        return pd.DataFrame(columns=["movie_id", "feedback"])
-    return pd.read_csv(path)
+        return pd.DataFrame(columns=["movie_id", "feedback", "scope"])
+    df = pd.read_csv(path)
+    if "scope" not in df.columns:
+        df["scope"] = "recommendation"
+    else:
+        df["scope"] = df["scope"].fillna("recommendation")
+    return df
 
 
-def save_feedback(movie_id: str, feedback: str, path: str | Path = FEEDBACK_PATH) -> None:
+def save_feedback(movie_id: str, feedback: str, scope: str = "recommendation", path: str | Path = FEEDBACK_PATH) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = load_feedback(path)
@@ -208,10 +247,10 @@ def save_feedback(movie_id: str, feedback: str, path: str | Path = FEEDBACK_PATH
         return
     exists = path.exists()
     with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["movie_id", "feedback"])
+        writer = csv.DictWriter(f, fieldnames=["movie_id", "feedback", "scope"])
         if not exists:
             writer.writeheader()
-        writer.writerow({"movie_id": movie_id, "feedback": feedback})
+        writer.writerow({"movie_id": movie_id, "feedback": feedback, "scope": scope})
 
 
 def remove_feedback_from_csv(movie_id: str, labels: list, path: str | Path = FEEDBACK_PATH) -> None:
@@ -445,9 +484,10 @@ def add_feedback_similarity(candidates: pd.DataFrame, feedback: pd.DataFrame, me
     corpus = fb["feature_text"].tolist() + out.loc[cand_idx, "feature_text"].fillna("").tolist()
     matrix = TfidfVectorizer(min_df=1, ngram_range=(1, 2), max_features=12000).fit_transform(corpus)
     sims = cosine_similarity(matrix[len(fb):], matrix[:len(fb)])
-    weights = fb["feedback"].map({k: v["weight"] for k, v in FEEDBACK_LABELS.items()}).fillna(0).to_numpy()
+    label_w = {k: v["weight"] for k, v in FEEDBACK_LABELS.items()}
+    weights = (fb["feedback"].map(label_w).fillna(0) * _scope_multiplier(fb)).to_numpy()
     out.loc[cand_idx, "feedback_score"] = (sims @ weights).clip(-3.0, 3.0)
-    direct = feedback["feedback"].map({k: v["weight"] for k, v in FEEDBACK_LABELS.items()}).fillna(0)
+    direct = feedback["feedback"].map(label_w).fillna(0) * _scope_multiplier(feedback)
     direct_adj = feedback.assign(direct_score=direct).groupby("movie_id", as_index=False)["direct_score"].sum()
     out = out.merge(direct_adj, on="movie_id", how="left")
     out["feedback_score"] = out["feedback_score"].fillna(0) + out["direct_score"].fillna(0)
@@ -480,6 +520,8 @@ def explain_short(row: pd.Series, taste_mode: str = "Balanced") -> str:
         parts.append("Strong taste match")
     elif cs > 0.75:
         parts.append("Matches taste profile")
+    if float(row.get("theme_score", 0) or 0) >= 2.0:
+        parts.append("Thematically similar")
     if abs(fb) > 0.2:
         parts.append("Taste feedback: positive" if fb > 0 else "Taste feedback: negative")
     if float(row.get("taste_mode_score", 0) or 0) > 0:
@@ -500,9 +542,11 @@ def explain_short(row: pd.Series, taste_mode: str = "Balanced") -> str:
 def explain_detailed(row: pd.Series, taste_mode: str = "Balanced") -> str:
     reasons = []
     if float(row.get("anchor_score", 0) or 0) > 0.5:
-        reasons.append("similar to your chosen anchor film")
+        reasons.append("thematically similar to your chosen anchor film")
     if row.get("content_score", 0) > 0.75:
         reasons.append("matches your high-rated taste profile: {}".format(row.get("taste_matches", "")))
+    if float(row.get("theme_score", 0) or 0) >= 1.5:
+        reasons.append("explores themes/concepts like the films you rate highly")
     if abs(float(row.get("feedback_score", 0) or 0)) > 0.2:
         reasons.append("adjusted by similarity to movies you tagged with taste feedback")
     entity = float(row.get("entity_score", 0) or 0)
@@ -526,31 +570,40 @@ def explain_detailed(row: pd.Series, taste_mode: str = "Balanced") -> str:
 
 
 def add_anchor_similarity(candidates: pd.DataFrame, anchor_movie_id: str | None, metadata: pd.DataFrame | None) -> pd.DataFrame:
-    """Boost candidates similar to one specific film the user picks as an anchor."""
+    """Boost candidates that are *thematically* similar to one anchor film.
+
+    Now delegates to theme_similarity so "similar to Inception" means "explores the same
+    ideas" (dreams, bent reality) rather than "same director / genre / cast". Scaled to 4.0
+    (on par with content_score) so an explicit anchor is a primary signal; tunable via the
+    anchor weight.
+    """
     out = candidates.copy()
     out["anchor_score"] = 0.0
     if not anchor_movie_id or metadata is None:
         return out
     meta = prepare_metadata(metadata)
-    if meta.empty or "feature_text" not in out.columns:
+    if meta.empty or "movie_id" not in out.columns:
         return out
-    anchor_rows = meta[meta["movie_id"] == anchor_movie_id]
-    if anchor_rows.empty:
+    out["anchor_score"] = theme_similarity.theme_anchor_scores(out, anchor_movie_id, meta)
+    return out
+
+
+def add_theme_similarity(candidates: pd.DataFrame, ratings: pd.DataFrame, likes: pd.DataFrame | None, metadata: pd.DataFrame | None) -> pd.DataFrame:
+    """Standalone 'what a film is about' channel vs the themes of your high-rated films.
+
+    Distinct from content_score (which is dominated by genre/director/cast); this measures
+    conceptual/thematic closeness only (keywords + overview).
+    """
+    out = candidates.copy()
+    out["theme_score"] = 0.0
+    if metadata is None:
         return out
-    anchor_text = str(anchor_rows.iloc[0].get("feature_text", ""))
-    if not anchor_text:
+    meta = prepare_metadata(metadata)
+    if meta.empty or "movie_id" not in out.columns:
         return out
-    cand_texts = out["feature_text"].fillna("")
-    cand_idx = cand_texts.str.len().gt(0)
-    if not cand_idx.any():
-        return out
-    corpus = [anchor_text] + cand_texts[cand_idx].tolist()
-    matrix = TfidfVectorizer(min_df=1, ngram_range=(1, 2), max_features=8000).fit_transform(corpus)
-    sims = cosine_similarity(matrix[1:], matrix[:1]).flatten()
-    max_sim = sims.max()
-    # Scale to 4.0 (on par with content_score) so an explicitly chosen anchor is a
-    # primary signal rather than a weak nudge. Further tunable via the anchor weight.
-    out.loc[cand_idx, "anchor_score"] = (sims / max_sim * 4.0) if max_sim > 0 else 0.0
+    out["theme_score"] = theme_similarity.theme_taste_scores(
+        out, ratings, likes if likes is not None else pd.DataFrame(), meta
+    )
     return out
 
 
@@ -569,7 +622,7 @@ def apply_mood_avoidance(candidates: pd.DataFrame, avoid_moods: List[str], penal
     return out
 
 
-def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame | None = None, mode: str = "watchlist", feedback: pd.DataFrame | None = None, taste_mode: str = "Balanced", score_weights: Dict[str, float] | None = None, anchor_movie_id: str | None = None, avoid_moods: List[str] | None = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame | None = None, mode: str = "watchlist", feedback: pd.DataFrame | None = None, taste_mode: str = "Balanced", score_weights: Dict[str, float] | None = None, anchor_movie_id: str | None = None, avoid_moods: List[str] | None = None, anchor_focus: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame]:
     candidates = candidate_pool(data, mode=mode)
     meta = prepare_metadata(metadata)
     if mode == "outside_watchlist" and not meta.empty:
@@ -577,7 +630,15 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
         rated_ids = set(data["ratings"].get("movie_id", pd.Series(dtype=str)).dropna())
         watchlist_ids = set(data["watchlist"].get("movie_id", pd.Series(dtype=str)).dropna())
         known_ids = set(candidates.get("movie_id", pd.Series(dtype=str)).dropna())
-        extra = meta[~meta["movie_id"].isin(watched_ids | rated_ids | watchlist_ids | known_ids)][["Name", "Year", "movie_id", "tmdb_url"]].copy()
+        outside = meta[~meta["movie_id"].isin(watched_ids | rated_ids | watchlist_ids | known_ids)]
+        # Scope the metadata-sourced pool to genuinely *discovered* films (those carrying
+        # `discovered_from` provenance), so cache entries fetched only to enrich the watchlist
+        # don't leak into "Not on my watchlist". Fall back to all cached rows only when the
+        # cache predates the column entirely, so older caches aren't left with an empty pool.
+        if "discovered_from" in outside.columns:
+            provenance = outside["discovered_from"].fillna("").astype(str).str.strip()
+            outside = outside[provenance != ""]
+        extra = outside[["Name", "Year", "movie_id", "tmdb_url"]].copy()
         extra["Letterboxd URI"] = ""
         candidates = pd.concat([candidates, extra], ignore_index=True, sort=False).drop_duplicates("movie_id")
     candidates, decade_prefs = add_heuristic_scores(candidates, data)
@@ -586,12 +647,21 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     candidates["taste_mode_score"] = candidates.apply(lambda row: taste_mode_score(row, taste_mode), axis=1)
     candidates = add_entity_affinity(candidates, data["ratings"], metadata)
     candidates = add_anchor_similarity(candidates, anchor_movie_id, metadata)
+    candidates = add_theme_similarity(candidates, data["ratings"], data["likes"], metadata)
 
     weights = score_weights or {}
     content_w = float(weights.get("content", 1.0))
     entity_w = float(weights.get("entity", 1.0))
     list_w = float(weights.get("list", 1.0))
     anchor_w = float(weights.get("anchor", 1.0))
+    theme_w = float(weights.get("theme", 1.0))
+    feedback_w = float(weights.get("feedback", 1.0))
+    # Anchor-focus: when a film is anchored, ease off the personal-taste signals so the
+    # anchor leads ("show me films like THIS"), instead of global taste cancelling it.
+    if anchor_movie_id and anchor_focus:
+        content_w *= ANCHOR_FOCUS_SCALE
+        theme_w *= ANCHOR_FOCUS_SCALE
+        entity_w *= ANCHOR_FOCUS_SCALE
     # Strip the 3.0 floor and list_contribution (re-added below with its own weight) so
     # the heuristic contributes only its deviation, damped to a tie-breaker.
     base_heuristic = (candidates["heuristic_score"] - candidates["list_contribution"] - 3.0) * HEURISTIC_WEIGHT
@@ -599,10 +669,11 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
         base_heuristic
         + candidates["list_contribution"] * list_w
         + candidates["content_score"] * content_w
-        + candidates["feedback_score"]
+        + candidates["feedback_score"] * feedback_w
         + candidates["taste_mode_score"]
         + candidates["entity_score"] * entity_w
         + candidates["anchor_score"] * anchor_w
+        + candidates["theme_score"] * theme_w
     )
     candidates = apply_mood_avoidance(candidates, avoid_moods or [])
     candidates["list_names_full"] = candidates.get("list_names", pd.Series(dtype=str)).fillna("").astype(str)
@@ -611,7 +682,7 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     candidates["taste_matches"] = candidates["taste_matches_full"].apply(lambda s: s if len(s) <= 140 else s[:137] + "...")
     candidates["why_details"] = candidates.apply(lambda row: explain_detailed(row, taste_mode), axis=1)
     candidates["why"] = candidates.apply(lambda row: explain_short(row, taste_mode), axis=1)
-    cols = ["Name", "Year", "score", "heuristic_score", "list_contribution", "content_similarity", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "mood_penalty", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
+    cols = ["Name", "Year", "score", "heuristic_score", "list_contribution", "content_similarity", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "theme_score", "mood_penalty", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
     for optional_col in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "poster_url", "overview", "tmdb_vote_average", "tmdb_popularity", "discovered_from"]:
         if optional_col in candidates.columns:
             cols.append(optional_col)

@@ -1,6 +1,14 @@
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import logging
+import math
 import os
+
+# Streamlit's hot-reload watcher walks every imported module; when optional theme
+# embeddings pull in `transformers`, its lazy vision submodules fail to import
+# `torchvision` (which we don't use) and the watcher logs a traceback for each.
+# Silence that one noisy logger without disabling hot-reload.
+logging.getLogger("streamlit.watcher.local_sources_watcher").setLevel(logging.ERROR)
 
 import pandas as pd
 import plotly.express as px
@@ -16,6 +24,7 @@ except ImportError:
 
 from curator import CURATION_STYLES, anchor_options, build_curated_list
 from recommender import (
+    ANCHOR_FOCUS_SCALE,
     apply_filters,
     available_filter_values,
     build_recommendations,
@@ -429,10 +438,12 @@ taste_mode = st.sidebar.selectbox("Taste mode", filter_values_preview.get("taste
 with st.sidebar.expander("Scoring weights"):
     st.caption("Drag to change how much each signal pulls the final score.")
     content_weight = st.slider("Taste similarity", 0.0, 3.0, 1.0, 0.25, help="How strongly TF-IDF content similarity to your high-rated films affects the score.")
+    theme_weight = st.slider("Theme similarity", 0.0, 3.0, 1.0, 0.25, help="How strongly conceptual/thematic similarity (what a film is *about* — keywords + overview) to your high-rated films affects the score. Independent of genre/director/cast.")
     entity_weight = st.slider("Director / cast influence", 0.0, 3.0, 1.0, 0.25, help="How strongly a shared director, writer, or cast member you've rated highly affects the score.")
     list_weight = st.slider("List signals", 0.0, 3.0, 1.0, 0.25, help="How much being on your curated lists counts.")
-    anchor_weight = st.slider("Anchor influence", 0.0, 3.0, 1.0, 0.25, help="How strongly the film you anchor on (Recommendations page) pulls similar candidates up.")
-score_weights = {"content": content_weight, "entity": entity_weight, "list": list_weight, "anchor": anchor_weight}
+    anchor_weight = st.slider("Anchor influence", 0.0, 3.0, 1.0, 0.25, help="How strongly the film you anchor on (Recommendations page) pulls thematically similar candidates up.")
+    feedback_weight = st.slider("Watched-movie feedback", 0.0, 3.0, 1.0, 0.25, help="How strongly the taste labels you give watched films (Analysis → Tune watched movies) pull recommendations toward or away from similar films. Deliberate tuning already counts more than passive feedback.")
+score_weights = {"content": content_weight, "theme": theme_weight, "entity": entity_weight, "list": list_weight, "anchor": anchor_weight, "feedback": feedback_weight}
 
 page = st.sidebar.radio("Page", ["Tonight's Pick", "Recommendations", "Analysis", "Evaluation", "Curated Weeks", "Database", "Sync status"])
 
@@ -446,11 +457,11 @@ col4.metric("Custom list entries", len(data["lists"]))
 col5.metric("Metadata coverage", f"{known_count}/{len(all_movies)}")
 
 
-def store_feedback(movie_id: str, feedback_value: str) -> None:
+def store_feedback(movie_id: str, feedback_value: str, scope: str = "recommendation") -> None:
     if use_database:
-        save_feedback_to_db(movie_id, feedback_value, db_path=db_path)
+        save_feedback_to_db(movie_id, feedback_value, scope=scope, db_path=db_path)
     else:
-        save_feedback(movie_id, feedback_value)
+        save_feedback(movie_id, feedback_value, scope=scope)
 
 
 def remove_feedback(movie_id: str, labels: list) -> None:
@@ -482,6 +493,9 @@ def poster_card(row: pd.Series, idx: int) -> None:
         st.markdown(chips_html(mood_items, accent=True), unsafe_allow_html=True)
     if row.get("why"):
         st.caption(str(row.get("why")))
+    _disc = row.get("discovered_from")
+    if pd.notna(_disc) and str(_disc).strip():
+        st.caption(f"🔎 Discovered from: {str(_disc).strip()}")
     with st.expander("Why?"):
         render_reasons(row.get("why_details", row.get("why", "")))
         if row.get("overview"):
@@ -525,10 +539,17 @@ def curated_week_card(row: pd.Series) -> None:
             st.link_button("Open in TMDb", tmdb_url)
 
 
-def render_score_breakdown(row: pd.Series, score_weights: dict) -> None:
+def render_score_breakdown(row: pd.Series, score_weights: dict, anchor_active: bool = False) -> None:
     content_w = float(score_weights.get("content", 1.0))
+    theme_w = float(score_weights.get("theme", 1.0))
     entity_w = float(score_weights.get("entity", 1.0))
     list_w = float(score_weights.get("list", 1.0))
+    anchor_w = float(score_weights.get("anchor", 1.0))
+    # Mirror build_recommendations' anchor-focus attenuation so the chart stays honest.
+    if anchor_active:
+        content_w *= ANCHOR_FOCUS_SCALE
+        theme_w *= ANCHOR_FOCUS_SCALE
+        entity_w *= ANCHOR_FOCUS_SCALE
 
     list_contrib = float(row.get("list_contribution", 0) or 0)
     heuristic = float(row.get("heuristic_score", 3.0) or 3.0)
@@ -538,10 +559,11 @@ def render_score_breakdown(row: pd.Series, score_weights: dict) -> None:
         ("Decade & recency", base_delta),
         ("List signals", list_contrib * list_w),
         ("Taste similarity", float(row.get("content_score", 0) or 0) * content_w),
+        ("Theme similarity", float(row.get("theme_score", 0) or 0) * theme_w),
         ("Feedback", float(row.get("feedback_score", 0) or 0)),
         ("Taste mode", float(row.get("taste_mode_score", 0) or 0)),
         ("Dir / Cast affinity", float(row.get("entity_score", 0) or 0) * entity_w),
-        ("Anchor match", float(row.get("anchor_score", 0) or 0)),
+        ("Anchor match", float(row.get("anchor_score", 0) or 0) * anchor_w),
         ("Mood penalty", -float(row.get("mood_penalty", 0) or 0)),
     ]
     components = [(label, val) for label, val in components if abs(val) > 0.01]
@@ -640,6 +662,9 @@ if page == "Tonight's Pick":
             if mood_items:
                 html += chips_html(mood_items, accent=True)
             st.markdown(html, unsafe_allow_html=True)
+            _disc = pick.get("discovered_from")
+            if pd.notna(_disc) and str(_disc).strip():
+                st.caption(f"🔎 Discovered from: {str(_disc).strip()}")
             with st.expander("Why this?", expanded=True):
                 render_reasons(str(pick.get("why_details") or pick.get("why", "")))
                 if pick.get("overview"):
@@ -679,8 +704,9 @@ elif page == "Recommendations":
 
     # --- Anchor film ---
     anchor_movie_id = None
+    anchor_focus = True
     with st.expander("Anchor on a film", expanded=False):
-        st.caption("Pick a film you love and the engine will boost candidates most similar to it.")
+        st.caption("Pick a film you love and the engine will boost candidates that are thematically similar to it.")
         if metadata.empty:
             st.info("Fetch TMDb metadata first to enable film anchoring.")
         else:
@@ -695,10 +721,14 @@ elif page == "Recommendations":
             else:
                 anchor_labels = ["— none —"] + [f"{r.Name} ({r.Year})" for r in anchor_pool.itertuples()]
                 anchor_choice = st.selectbox("Film to anchor on", anchor_labels)
+                anchor_focus = st.checkbox(
+                    "Anchor focus", value=True,
+                    help="Let the anchored film lead by easing off your general taste profile, so concept-cousins aren't cancelled out.",
+                )
                 if anchor_choice != "— none —":
                     chosen_idx = anchor_labels.index(anchor_choice) - 1
                     anchor_movie_id = str(anchor_pool.iloc[chosen_idx]["movie_id"])
-                    st.caption(f"Boosting candidates similar to: **{anchor_choice}**")
+                    st.caption(f"Boosting candidates thematically similar to: **{anchor_choice}**")
 
     # --- Mood avoidance ---
     with st.expander("Not in the mood for...", expanded=False):
@@ -711,6 +741,7 @@ elif page == "Recommendations":
         recs, decade_prefs = _build_recs(
             data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode,
             score_weights=score_weights, anchor_movie_id=anchor_movie_id, avoid_moods=avoid_moods,
+            anchor_focus=anchor_focus,
         )
 
     filter_values = available_filter_values(recs)
@@ -746,7 +777,7 @@ elif page == "Recommendations":
                     with col:
                         poster_card(top.iloc[idx], idx)
     else:
-        show_cols = ["Name", "Year", "score", "heuristic_score", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "mood_penalty", "why", "Letterboxd URI"]
+        show_cols = ["Name", "Year", "score", "heuristic_score", "content_score", "theme_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "mood_penalty", "why", "Letterboxd URI"]
         show_cols += [c for c in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "discovered_from"] if c in filtered.columns]
         st.dataframe(filtered[show_cols].head(100), use_container_width=True, hide_index=True)
 
@@ -770,7 +801,7 @@ elif page == "Recommendations":
                         render_reasons(tastes)
             with st.expander("Score breakdown", expanded=False):
                 full_row = filtered.head(100).iloc[sel_idx]
-                render_score_breakdown(full_row, score_weights)
+                render_score_breakdown(full_row, score_weights, anchor_active=bool(anchor_movie_id and anchor_focus))
 
     st.download_button("Download recommendations as CSV", filtered.to_csv(index=False).encode("utf-8"), "movie_recommendations.csv", "text/csv")
 
@@ -848,41 +879,94 @@ elif page == "Analysis":
 
         # Tune watched movies section
         st.subheader("Tune watched movies")
-        st.write("Use these labels to provide richer taste signals for better recommendations. This feedback is stronger than passive ratings.")
+        st.write("Tag watched films with taste labels to steer recommendations. Deliberate tuning here counts more than passive ratings or recommendation feedback.")
 
-        # Get watched/rated movies
-        watched_movies = data["watched"].copy()
+        # Rated first so movies that are both watched and rated keep their Rating after dedup.
         rated_movies = data["ratings"].copy()
-        all_watched = pd.concat([watched_movies, rated_movies], ignore_index=True).drop_duplicates("movie_id")
+        watched_movies = data["watched"].copy()
+        all_watched = pd.concat([rated_movies, watched_movies], ignore_index=True).drop_duplicates("movie_id")
 
         if all_watched.empty:
             st.info("No watched movies found.")
         else:
-            # Merge with metadata and feedback
             tuned_movies = all_watched.copy()
+            if "Rating" not in tuned_movies.columns:
+                tuned_movies["Rating"] = pd.NA
             if not metadata.empty:
                 meta_prepared = prepare_metadata(metadata)
                 tuned_movies = tuned_movies.merge(
                     meta_prepared[["movie_id", "overview", "genres", "directors", "poster_url"]],
                     on="movie_id",
-                    how="left"
+                    how="left",
                 )
+            # Attach current feedback labels (only watched_tuning + generic taste labels shown here).
             if not feedback.empty:
                 feedback_agg = feedback.groupby("movie_id")["feedback"].agg(list).reset_index()
                 tuned_movies = tuned_movies.merge(feedback_agg, on="movie_id", how="left")
+            if "feedback" not in tuned_movies.columns:
+                tuned_movies["feedback"] = pd.NA
 
-            # Add search/filter
-            search_term = st.text_input("Search movies", key="tune_search")
+            def _labels(val):
+                if isinstance(val, list):
+                    return [f for f in val if f in FEEDBACK_LABELS]
+                if pd.notna(val) and val in FEEDBACK_LABELS:
+                    return [val]
+                return []
+
+            tuned_movies["_labels"] = tuned_movies["feedback"].apply(_labels)
+            tuned_movies["_tagged"] = tuned_movies["_labels"].apply(bool)
+
+            total_count = len(tuned_movies)
+            tagged_count = int(tuned_movies["_tagged"].sum())
+            st.caption(f"Tagged {tagged_count} of {total_count} watched films.")
+
+            # Filters
+            fcol1, fcol2, fcol3 = st.columns([2, 1, 2])
+            search_term = fcol1.text_input("Search movies", key="tune_search")
+            only_untagged = fcol2.checkbox("Only untagged", key="tune_untagged")
+            rating_range = fcol3.slider(
+                "Rating range", 0.5, 5.0, (0.5, 5.0), 0.5, key="tune_rating_range",
+                help="Filter by your star rating. Narrow either end to hide films outside the range; unrated films show only at the full range.",
+            )
+
+            view = tuned_movies
             if search_term:
                 mask = (
-                    tuned_movies["Name"].str.lower().str.contains(search_term.lower(), na=False) |
-                    tuned_movies["Year"].astype(str).str.contains(search_term, na=False)
+                    view["Name"].str.lower().str.contains(search_term.lower(), na=False)
+                    | view["Year"].astype(str).str.contains(search_term, na=False)
                 )
-                tuned_movies = tuned_movies[mask]
+                view = view[mask]
+            if only_untagged:
+                view = view[~view["_tagged"]]
+            lo, hi = rating_range
+            if (lo, hi) != (0.5, 5.0):
+                view = view[pd.to_numeric(view["Rating"], errors="coerce").between(lo, hi)]
 
-            # Show movies with feedback controls
-            st.write(f"Showing {len(tuned_movies)} movies")
-            for idx, row in tuned_movies.iterrows():
+            # Highest-signal first: untagged before tagged, then by rating desc.
+            view = view.assign(_rating_sort=pd.to_numeric(view["Rating"], errors="coerce").fillna(-1))
+            view = view.sort_values(["_tagged", "_rating_sort"], ascending=[True, False])
+
+            # Pagination
+            PAGE_SIZE = 25
+            n_pages = max(1, math.ceil(len(view) / PAGE_SIZE))
+            page_num = min(st.session_state.get("tune_page", 0), n_pages - 1)
+            pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
+            if pcol1.button("◀ Prev", disabled=page_num <= 0, key="tune_prev"):
+                st.session_state["tune_page"] = page_num - 1
+                st.rerun()
+            pcol2.markdown(f"<div style='text-align:center'>Page {page_num + 1} of {n_pages} — {len(view)} films</div>", unsafe_allow_html=True)
+            if pcol3.button("Next ▶", disabled=page_num >= n_pages - 1, key="tune_next"):
+                st.session_state["tune_page"] = page_num + 1
+                st.rerun()
+
+            page_rows = view.iloc[page_num * PAGE_SIZE:(page_num + 1) * PAGE_SIZE]
+
+            # Render page; widget values are read back at save time from session_state.
+            page_state = []  # (movie_id, current_labels, widget_key)
+            for _, row in page_rows.iterrows():
+                mid = row["movie_id"]
+                current_feedback = row["_labels"]
+                widget_key = f"tunefb_{mid}"
                 with st.container():
                     col1, col2, col3 = st.columns([1, 3, 2])
                     with col1:
@@ -902,28 +986,31 @@ elif page == "Analysis":
                         if pd.notna(rating):
                             st.caption(f"Your rating: {rating}/5")
                     with col3:
-                        current_feedback = row.get("feedback", [])
-                        if not isinstance(current_feedback, list):
-                            current_feedback = [current_feedback] if pd.notna(current_feedback) else []
-                        current_feedback = [f for f in current_feedback if f in FEEDBACK_LABELS]
-
-                        selected = st.multiselect(
+                        st.multiselect(
                             "Taste feedback",
                             options=list(FEEDBACK_LABELS.keys()),
                             default=current_feedback,
                             format_func=lambda x: FEEDBACK_LABELS[x]["description"],
-                            key=f"feedback_{row['movie_id']}_{idx}",
+                            key=widget_key,
                         )
+                page_state.append((mid, current_feedback, widget_key))
 
-                        new_labels = [l for l in selected if l not in current_feedback]
-                        removed_labels = [l for l in current_feedback if l not in selected]
-                        if new_labels or removed_labels:
-                            if st.button("Save feedback", key=f"save_{row['movie_id']}_{idx}"):
-                                for label in new_labels:
-                                    store_feedback(row["movie_id"], label)
-                                if removed_labels:
-                                    remove_feedback(row["movie_id"], removed_labels)
-                                st.rerun()
+            if page_rows.empty:
+                st.info("No films match these filters.")
+            elif st.button("Save changes on this page", type="primary", key="tune_save_page"):
+                changed = 0
+                for mid, current_feedback, widget_key in page_state:
+                    selected = st.session_state.get(widget_key, current_feedback)
+                    new_labels = [l for l in selected if l not in current_feedback]
+                    removed_labels = [l for l in current_feedback if l not in selected]
+                    for label in new_labels:
+                        store_feedback(mid, label, scope="watched_tuning")
+                    if removed_labels:
+                        remove_feedback(mid, removed_labels)
+                    if new_labels or removed_labels:
+                        changed += 1
+                st.success(f"Saved changes for {changed} film(s).")
+                st.rerun()
 
 elif page == "Evaluation":
     st.subheader("Evaluation against historical ratings")
