@@ -148,7 +148,10 @@ def _scale_net(values: np.ndarray) -> np.ndarray:
         return values
     pos = values[values > 0]
     if values.size < SMALL_SET or pos.size == 0:
-        ref = values.max()
+        # No positive values to anchor on (e.g. a negative-penalty-heavy taste profile) —
+        # scale by magnitude instead of collapsing the whole channel to zero, so the
+        # least-dissimilar candidates still outrank the most-dissimilar ones.
+        ref = float(np.abs(values).max())
     else:
         ref = float(np.percentile(pos, SIM_PERCENTILE))
     if ref <= 0:

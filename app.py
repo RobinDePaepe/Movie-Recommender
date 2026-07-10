@@ -222,6 +222,16 @@ inject_theme()
 render_hero()
 
 
+def fmt_year(value) -> str:
+    """Render a Year value without the trailing '.0' pandas float coercion leaves behind."""
+    if pd.isna(value) or str(value).strip() in ("", "nan", "<NA>"):
+        return ""
+    try:
+        return str(int(float(value)))
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def render_reasons(text: str, sep: str = ";") -> None:
     """Render a separator-delimited reason string as markdown bullet points.
 
@@ -250,12 +260,13 @@ db_path = Path("data/movie_recommender.sqlite")
 use_database = db_path.exists()
 
 # --- Startup auto-sync ---
-# Runs once per session if LETTERBOXD_USERNAME is set and last sync was > 1 hour ago.
-# Updates overlay CSVs (and SQLite if active) before data loads, so the session starts fresh.
+# Runs once per session if LETTERBOXD_USERNAME (or LETTERBOXD_RSS_CLIENT_ID, a direct RSS
+# URL) is set and last sync was > 1 hour ago. Updates overlay CSVs (and SQLite if active)
+# before data loads, so the session starts fresh.
 if "auto_synced_this_session" not in st.session_state:
     st.session_state.auto_synced_this_session = False
 
-_lb_auto_user = os.getenv("LETTERBOXD_USERNAME", "")
+_lb_auto_user = os.getenv("LETTERBOXD_USERNAME", "") or os.getenv("LETTERBOXD_RSS_CLIENT_ID", "")
 _auto_new_events = 0
 if not st.session_state.auto_synced_this_session and _lb_auto_user:
     _sync_state = sync_status()
@@ -286,14 +297,15 @@ else:
     base_data = load_letterboxd(export_dir)
     data = apply_sync_overlays(base_data)
 
+_movie_cols = ["Name", "Year", "movie_id"]
 movie_frames = [
-    data["ratings"][["Name", "Year"]],
-    data["watched"][["Name", "Year"]],
-    data["watchlist"][["Name", "Year"]],
-    data["likes"][["Name", "Year"]],
+    data["ratings"].reindex(columns=_movie_cols),
+    data["watched"].reindex(columns=_movie_cols),
+    data["watchlist"].reindex(columns=_movie_cols),
+    data["likes"].reindex(columns=_movie_cols),
 ]
 if not data["lists"].empty:
-    movie_frames.append(data["lists"][["Name", "Year"]])
+    movie_frames.append(data["lists"].reindex(columns=_movie_cols))
 all_movies = pd.concat(movie_frames, ignore_index=True).drop_duplicates()
 
 if _auto_new_events > 0:
@@ -309,7 +321,10 @@ api_key_input = st.sidebar.text_input(
 cache_path = Path("data/tmdb_cache.json")
 if use_database:
     metadata = load_metadata_from_db(db_path)
-    metadata_known = metadata
+    # Coverage should reflect metadata found for movies you actually track (all_movies),
+    # not every row in movie_metadata (which also includes discovered-but-untracked candidates).
+    known_ids = set(all_movies.get("movie_id", pd.Series(dtype=str)).dropna())
+    metadata_known = metadata[metadata.get("movie_id", pd.Series(dtype=str)).isin(known_ids)] if not metadata.empty else metadata
     feedback = load_feedback_from_db(db_path)
 else:
     metadata = metadata_from_cache(None, cache_path=cache_path, include_all=True)
@@ -395,6 +410,8 @@ with st.sidebar.expander("Enrich known Letterboxd movies"):
             client = TMDbClient(api_key=key, cache_path=cache_path)
             with st.spinner("Fetching and caching TMDb metadata..."):
                 result = enrich_movies(all_movies, client=client, limit=int(limit), force=force)
+                if use_database:
+                    import_tmdb_cache(cache_path=cache_path, db_path=db_path)
             st.success(f"Fetched or refreshed {len(result)} movies. Refreshing recommendations.")
             st.rerun()
 
@@ -420,6 +437,8 @@ with st.sidebar.expander("Discover new outside-watchlist candidates"):
                 client = TMDbClient(api_key=key, cache_path=cache_path)
                 with st.spinner("Discovering and caching outside-watchlist candidates..."):
                     discovered = discover_movies_from_favorites(favorite_meta, client=client, per_seed=int(per_seed), seed_limit=int(seed_limit))
+                    if use_database:
+                        import_tmdb_cache(cache_path=cache_path, db_path=db_path)
                 st.success(f"Discovered/cached {len(discovered)} candidate movies. Refreshing recommendations.")
                 st.rerun()
 
@@ -472,13 +491,16 @@ def remove_feedback(movie_id: str, labels: list) -> None:
 
 
 def poster_card(row: pd.Series, idx: int) -> None:
-    title = f"{row.get('Name', '')} ({row.get('Year', '')})"
+    title = f"{row.get('Name', '')} ({fmt_year(row.get('Year'))})"
     _pu = row.get("poster_url")
     if pd.notna(_pu) and str(_pu).strip():
         st.image(str(_pu).strip(), use_container_width=True)
     else:
         st.info("No poster")
     st.markdown(f"**{title}**")
+    directors = row.get("directors", [])
+    if isinstance(directors, list) and directors:
+        st.caption(f"Dir. {', '.join(directors[:2])}")
     st.markdown(score_badge_html(float(row.get("score", 0) or 0)), unsafe_allow_html=True)
     rt = row.get("runtime", "")
     chip_items = [f"{rt} min"] if rt else []
@@ -522,8 +544,10 @@ def curated_week_card(row: pd.Series) -> None:
         else:
             st.info("No poster")
     with right:
-        st.markdown(f"### Day {int(row.get('day', 0))}: {row.get('Name', '')} ({row.get('Year', '')})")
-        st.caption(f"{row.get('role', '')} | {row.get('role_description', '')}")
+        st.markdown(f"### Day {int(row.get('day', 0))}: {row.get('Name', '')} ({fmt_year(row.get('Year'))})")
+        directors = row.get("directors", [])
+        director_caption = f"Dir. {', '.join(directors[:2])} | " if isinstance(directors, list) and directors else ""
+        st.caption(f"{director_caption}{row.get('role', '')} | {row.get('role_description', '')}")
         st.write(row.get("why", ""))
         if genres:
             st.caption("Genres: " + ", ".join(genres[:4]))
@@ -539,7 +563,75 @@ def curated_week_card(row: pd.Series) -> None:
             st.link_button("Open in TMDb", tmdb_url)
 
 
-def render_score_breakdown(row: pd.Series, score_weights: dict, anchor_active: bool = False) -> None:
+def _component_explanations(row: pd.Series, taste_mode: str = "Balanced") -> dict:
+    """Plain-language 'why this number' text for each score_breakdown bar.
+
+    Mirrors the same underlying columns as explain_detailed(), but keyed by the
+    exact component labels used in the chart and without a high activation
+    threshold, so every bar that's actually drawn gets an explanation.
+    """
+    text: dict = {}
+
+    decade = row.get("decade", "")
+    avg_user_rating = row.get("avg_user_rating")
+    decade_bits = []
+    if pd.notna(avg_user_rating) and decade:
+        decade_bits.append(f"you rate {decade} films {float(avg_user_rating):.1f}★ on average")
+    if float(row.get("liked_decade_bonus", 0) or 0) > 0:
+        decade_bits.append("shares a decade with films you liked")
+    if float(row.get("recency_bonus", 0) or 0) > 0:
+        decade_bits.append("recent release bonus")
+    if decade_bits:
+        text["Decade & recency"] = "; ".join(decade_bits).capitalize() + "."
+
+    list_count = int(row.get("list_count", 0) or 0)
+    if list_count > 0:
+        names = row.get("list_names_full") or row.get("list_names") or ""
+        text["List signals"] = f"In {list_count} list(s): {names}." if names else f"In {list_count} list(s)."
+
+    taste_matches = row.get("taste_matches_full") or row.get("taste_matches") or ""
+    if taste_matches:
+        text["Taste similarity"] = f"Matches your high-rated films on {taste_matches}."
+    elif float(row.get("content_score", 0) or 0) < 0:
+        text["Taste similarity"] = "Similar to films you rated poorly."
+
+    theme_score = float(row.get("theme_score", 0) or 0)
+    if abs(theme_score) > 0.01:
+        text["Theme similarity"] = (
+            "Explores similar keywords/concepts to films you rate highly."
+            if theme_score > 0
+            else "Keywords/concepts diverge from films you rate highly."
+        )
+
+    feedback_score = float(row.get("feedback_score", 0) or 0)
+    if abs(feedback_score) > 0.01:
+        text["Feedback"] = (
+            "Similar to movies you tagged as 'more like this' (or direct feedback on this film)."
+            if feedback_score > 0
+            else "Similar to movies you tagged as 'less like this' (or direct feedback on this film)."
+        )
+
+    if float(row.get("taste_mode_score", 0) or 0) > 0:
+        text["Taste mode"] = f"Fits the selected taste mode: {taste_mode}."
+
+    entity_score = float(row.get("entity_score", 0) or 0)
+    if abs(entity_score) > 0.01:
+        text["Dir / Cast affinity"] = (
+            "Directed/written/starring someone you've consistently rated highly."
+            if entity_score > 0
+            else "Involves a director/writer/cast member you've rated poorly in the past."
+        )
+
+    if float(row.get("anchor_score", 0) or 0) > 0.01:
+        text["Anchor match"] = "Thematically similar to your anchored film."
+
+    if float(row.get("mood_penalty", 0) or 0) > 0:
+        text["Mood penalty"] = "Matches a mood you're avoiding this session."
+
+    return text
+
+
+def render_score_breakdown(row: pd.Series, score_weights: dict, anchor_active: bool = False, taste_mode: str = "Balanced") -> None:
     content_w = float(score_weights.get("content", 1.0))
     theme_w = float(score_weights.get("theme", 1.0))
     entity_w = float(score_weights.get("entity", 1.0))
@@ -594,6 +686,11 @@ def render_score_breakdown(row: pd.Series, score_weights: dict, anchor_active: b
     )
     st.plotly_chart(fig, use_container_width=True)
 
+    explanations = _component_explanations(row, taste_mode)
+    lines = [f"- **{label}** ({val:+.2f}): {explanations[label]}" for label, val in components if label in explanations]
+    if lines:
+        st.markdown("\n".join(lines))
+
 
 if page == "Tonight's Pick":
     st.subheader("What should I watch tonight?")
@@ -646,7 +743,10 @@ if page == "Tonight's Pick":
             else:
                 st.info("No poster")
         with pc2:
-            st.markdown(f"## {pick.get('Name', '')} ({pick.get('Year', '')})")
+            st.markdown(f"## {pick.get('Name', '')} ({fmt_year(pick.get('Year'))})")
+            pick_directors = pick.get("directors", [])
+            if isinstance(pick_directors, list) and pick_directors:
+                st.caption(f"Dir. {', '.join(pick_directors[:2])}")
             chip_items = []
             rt = pick.get("runtime")
             if rt and str(rt).strip() not in ("", "nan", "<NA>"):
@@ -671,7 +771,7 @@ if page == "Tonight's Pick":
                     st.write(str(pick["overview"]))
 
         with st.expander("Score breakdown", expanded=False):
-            render_score_breakdown(pick, score_weights)
+            render_score_breakdown(pick, score_weights, taste_mode=tonight_taste)
 
         st.divider()
         ba, bb, bc = st.columns(3)
@@ -801,7 +901,7 @@ elif page == "Recommendations":
                         render_reasons(tastes)
             with st.expander("Score breakdown", expanded=False):
                 full_row = filtered.head(100).iloc[sel_idx]
-                render_score_breakdown(full_row, score_weights, anchor_active=bool(anchor_movie_id and anchor_focus))
+                render_score_breakdown(full_row, score_weights, anchor_active=bool(anchor_movie_id and anchor_focus), taste_mode=taste_mode)
 
     st.download_button("Download recommendations as CSV", filtered.to_csv(index=False).encode("utf-8"), "movie_recommendations.csv", "text/csv")
 
@@ -976,7 +1076,7 @@ elif page == "Analysis":
                         else:
                             st.write("📽️")
                     with col2:
-                        st.write(f"**{row['Name']} ({row['Year']})**")
+                        st.write(f"**{row['Name']} ({fmt_year(row.get('Year'))})**")
                         if pd.notna(row.get("overview")):
                             st.caption(row["overview"][:200] + "..." if len(str(row["overview"])) > 200 else str(row["overview"]))
                         genres = row.get("genres", [])
