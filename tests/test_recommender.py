@@ -295,6 +295,32 @@ def test_decade_score_is_shrunk_toward_mean():
     assert 0.0 < row["decade_score"] < raw_score
 
 
+# --- list-score cap: stacked list membership can't dwarf taste signals ---
+
+def test_list_contribution_is_capped_for_stacked_lists():
+    from recommender import LIST_SCORE_CAP, LIST_SCORE_SCALE, LIST_COUNT_WEIGHT
+
+    candidates = normalize_movie_key(pd.DataFrame([{"Name": "Stacked Film", "Year": 2010}]))
+    # Six "prestige" lists all matching the same list_weight() rule (1.5 each = 9.0 raw),
+    # comfortably over LIST_SCORE_CAP, so the cap must actually engage.
+    list_names = ["top-250", "best-of-all-time", "canon-classics", "masterworks-list", "essentials-2020", "critics-picks"]
+    lists = pd.concat([
+        normalize_movie_key(pd.DataFrame([{"Name": "Stacked Film", "Year": 2010, "source_list": name}]))
+        for name in list_names
+    ], ignore_index=True)
+    data = {
+        "ratings": pd.DataFrame(columns=["Name", "Year", "Rating"]),
+        "likes": pd.DataFrame(columns=["Name", "Year"]),
+        "lists": lists,
+    }
+    scored, _ = add_heuristic_scores(candidates, data)
+    max_possible = LIST_SCORE_CAP * LIST_SCORE_SCALE + 5 * LIST_COUNT_WEIGHT
+    contribution = scored.loc[0, "list_contribution"]
+    assert contribution <= max_possible + 1e-9
+    # And the raw (uncapped) score for these six lists would have exceeded the cap.
+    assert scored.loc[0, "list_score"] > LIST_SCORE_CAP
+
+
 # --- score composition: content beats heuristic-only (#1) ---
 
 def test_content_match_outranks_recent_only_film():

@@ -14,6 +14,9 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import re
+from streamlit_option_menu import option_menu
+from streamlit_extras.stylable_container import stylable_container
+from st_aggrid import AgGrid, GridOptionsBuilder
 
 try:
     from dotenv import load_dotenv, set_key, find_dotenv
@@ -23,6 +26,7 @@ except ImportError:
     _DOTENV_AVAILABLE = False
 
 from curator import CURATION_STYLES, anchor_options, build_curated_list
+from rate_review import render_reflection_panel
 from recommender import (
     ANCHOR_FOCUS_SCALE,
     apply_filters,
@@ -155,18 +159,67 @@ def inject_theme() -> None:
             box-shadow: 0 12px 30px rgba(0,0,0,0.7), 0 0 0 1px rgba(201,162,39,0.35);
         }
 
-        /* ---- Buttons ---- */
-        .stButton > button {
+        /* ---- Buttons: raised, clickable-looking controls instead of flat ghost boxes ---- */
+        [data-testid="stBaseButton-secondary"] {
             border-radius: 8px;
-            border: 1px solid rgba(255,255,255,0.12);
-            background: rgba(255,255,255,0.04);
-            font-weight: 500;
-            transition: all 0.16s ease;
+            border: 1px solid rgba(255,255,255,0.16);
+            background: linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.02));
+            color: #E8E6DE;
+            font-weight: 600;
+            padding: 0.5rem 1.15rem;
+            box-shadow: 0 1px 0 rgba(255,255,255,0.07) inset, 0 2px 6px rgba(0,0,0,0.4);
+            transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
         }
-        .stButton > button:hover {
+        [data-testid="stBaseButton-secondary"]:hover {
             border-color: rgba(201,162,39,0.6);
             color: #F5E6A8;
-            background: rgba(201,162,39,0.10);
+            background: linear-gradient(180deg, rgba(201,162,39,0.20), rgba(201,162,39,0.07));
+            box-shadow: 0 1px 0 rgba(255,255,255,0.08) inset, 0 8px 18px rgba(0,0,0,0.5);
+            transform: translateY(-1px);
+        }
+        [data-testid="stBaseButton-secondary"]:active {
+            transform: translateY(0);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.5) inset;
+        }
+        [data-testid="stBaseButton-secondary"]:focus-visible {
+            outline: 2px solid #C9A227;
+            outline-offset: 2px;
+        }
+        [data-testid="stBaseButton-secondary"]:disabled {
+            opacity: 0.4;
+            transform: none;
+            box-shadow: none;
+        }
+
+        /* Primary buttons (type="primary") get a solid gold fill so the one key action per view stands out */
+        [data-testid="stBaseButton-primary"] {
+            border: 1px solid rgba(201,162,39,0.75);
+            background: linear-gradient(135deg, #F5E6A8 0%, #C9A227 65%, #9C7A12 100%);
+            color: #1C1408;
+            font-weight: 700;
+            padding: 0.5rem 1.15rem;
+            box-shadow: 0 4px 14px rgba(201,162,39,0.35);
+            transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+        }
+        [data-testid="stBaseButton-primary"]:hover {
+            background: linear-gradient(135deg, #F8ECBC 0%, #D8AF3A 65%, #A9860F 100%);
+            border-color: rgba(201,162,39,0.95);
+            box-shadow: 0 8px 22px rgba(201,162,39,0.5);
+            transform: translateY(-1px);
+        }
+        [data-testid="stBaseButton-primary"]:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 8px rgba(201,162,39,0.4);
+        }
+        [data-testid="stBaseButton-primary"]:focus-visible {
+            outline: 2px solid #F5E6A8;
+            outline-offset: 2px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            [data-testid="stBaseButton-secondary"], [data-testid="stBaseButton-primary"] {
+                transition: none;
+            }
         }
 
         /* ---- Metric cards ---- */
@@ -251,6 +304,27 @@ def render_reasons(text: str, sep: str = ";") -> None:
     md = "\n".join(f"- {p}" for p in parts)
     st.markdown(md)
 
+
+def render_grid(df: pd.DataFrame, height: int = 420) -> None:
+    """Sortable/filterable data grid (AgGrid) with list-type columns flattened to text."""
+    grid_df = df.copy()
+    for col in grid_df.columns:
+        if grid_df[col].apply(lambda v: isinstance(v, list)).any():
+            grid_df[col] = grid_df[col].apply(lambda v: ", ".join(map(str, v)) if isinstance(v, list) else v)
+
+    gb = GridOptionsBuilder.from_dataframe(grid_df)
+    gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True, autoHeight=False)
+    gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=20)
+    AgGrid(
+        grid_df,
+        gridOptions=gb.build(),
+        theme="streamlit",
+        height=height,
+        fit_columns_on_grid_load=False,
+        allow_unsafe_jscode=False,
+    )
+
+
 export_zip = Path("data/letterboxd_export.zip")
 if not export_zip.exists():
     st.error("Put your Letterboxd export zip at data/letterboxd_export.zip")
@@ -311,13 +385,11 @@ all_movies = pd.concat(movie_frames, ignore_index=True).drop_duplicates()
 if _auto_new_events > 0:
     st.toast(f"Auto-synced Letterboxd: {_auto_new_events} new events added.")
 
-st.sidebar.header("TMDb metadata")
-api_key_input = st.sidebar.text_input(
-    "TMDb API key",
-    value=os.getenv("TMDB_API_KEY", ""),
-    type="password",
-    help="Optional. You can also set TMDB_API_KEY in your environment or Streamlit secrets.",
-)
+def get_tmdb_api_key() -> str:
+    """TMDb key entered on the Data & Sync page, falling back to the environment."""
+    return st.session_state.get("tmdb_api_key_input") or os.getenv("TMDB_API_KEY", "")
+
+
 cache_path = Path("data/tmdb_cache.json")
 if use_database:
     metadata = load_metadata_from_db(db_path)
@@ -334,116 +406,42 @@ else:
 cached_count = len(metadata) if not metadata.empty else 0
 known_count = len(metadata_known) if not metadata_known.empty else 0
 found_count = int(metadata.get("tmdb_found", pd.Series(dtype=bool)).fillna(False).sum()) if not metadata.empty else 0
-st.sidebar.metric("Cached movies", cached_count)
-st.sidebar.metric("Known-profile cached", known_count)
-st.sidebar.metric("TMDb matches", found_count)
-st.sidebar.caption("SQLite backend: " + ("on" if use_database else "off - using CSV/JSON files"))
-
-st.sidebar.header("Database")
-with st.sidebar.expander("SQLite database"):
-    st.write("Use SQLite as the app backend for analysis, history, rating changes, rewatches, metadata, and feedback.")
-    if st.button("Build / refresh database from local files"):
-        with st.spinner("Importing Letterboxd export, TMDb cache, and feedback into SQLite..."):
-            result = rebuild_database(export_zip=export_zip, cache_path=cache_path, db_path=db_path)
-        st.success("Database rebuilt.")
-        st.json(result)
-        st.rerun()
-    st.caption(f"Database path: {db_path}")
-
-st.sidebar.header("Letterboxd sync")
-status = sync_status()
-st.sidebar.caption(f"RSS events: {status.get('rss_events', 0)} | Last sync: {status.get('last_sync_at', 'never')}")
-with st.sidebar.expander("Sync recent activity from RSS"):
-    st.write("RSS updates recent watches, diary entries, rewatches, and ratings that appear in your public activity feed. Use a fresh export for full watchlist state and old rating edits.")
-    lb_username = st.text_input("Letterboxd username or RSS URL", value=os.getenv("LETTERBOXD_USERNAME", ""), help="Example: bslinky or https://letterboxd.com/bslinky/rss/")
-    if st.button("Sync Letterboxd RSS"):
-        if not lb_username:
-            st.error("Add your Letterboxd username or RSS URL first.")
-        else:
-            with st.spinner("Fetching Letterboxd RSS..."):
-                result = sync_rss(lb_username)
-            if use_database:
-                with st.spinner("Applying synced events to database..."):
-                    apply_rss_overlays_to_db(db_path=db_path)
-            new_ev = result.get("new_events", 0)
-            st.success(
-                f"Fetched {result.get('fetched_events', 0)} events; "
-                f"{new_ev} new."
-                + (" Database updated." if use_database else "")
-            )
-            # Persist username to .env so auto-sync works next session.
-            if _DOTENV_AVAILABLE and lb_username != os.getenv("LETTERBOXD_USERNAME", ""):
-                try:
-                    _env_file = find_dotenv(usecwd=True) or ".env"
-                    set_key(_env_file, "LETTERBOXD_USERNAME", lb_username)
-                except Exception:
-                    pass
-            st.rerun()
-
-with st.sidebar.expander("Replace with fresh Letterboxd export"):
-    st.write("Use this when you want authoritative updates for watchlist removals/additions, old rating edits, deleted ratings, and historical changes not present in RSS.")
-    uploaded_export = st.file_uploader("Upload latest Letterboxd export zip", type=["zip"])
-    if uploaded_export is not None and st.button("Install uploaded export"):
-        export_zip.parent.mkdir(parents=True, exist_ok=True)
-        export_zip.write_bytes(uploaded_export.getbuffer())
-        # Force re-extraction next run.
-        if Path("data/letterboxd").exists():
-            import shutil
-            shutil.rmtree(Path("data/letterboxd"))
-        if use_database:
-            with st.spinner("Rebuilding database from new export..."):
-                rebuild_database(export_zip=export_zip, cache_path=cache_path, db_path=db_path)
-            st.success("Installed new Letterboxd export and rebuilt database.")
-        else:
-            st.success("Installed latest Letterboxd export. Refreshing data.")
-        st.rerun()
-
-with st.sidebar.expander("Enrich known Letterboxd movies"):
-    st.write("Repeated runs skip already cached movies unless refresh is enabled.")
-    limit = st.number_input("Uncached movies to fetch this run", min_value=1, max_value=max(1, int(len(all_movies))), value=min(50, int(len(all_movies))), step=25)
-    force = st.checkbox("Refresh existing cached movies", value=False)
-    if st.button("Fetch TMDb metadata"):
-        key = api_key_input or os.getenv("TMDB_API_KEY")
-        if not key:
-            st.error("Add a TMDb API key first.")
-        else:
-            client = TMDbClient(api_key=key, cache_path=cache_path)
-            with st.spinner("Fetching and caching TMDb metadata..."):
-                result = enrich_movies(all_movies, client=client, limit=int(limit), force=force)
-                if use_database:
-                    import_tmdb_cache(cache_path=cache_path, db_path=db_path)
-            st.success(f"Fetched or refreshed {len(result)} movies. Refreshing recommendations.")
-            st.rerun()
-
-with st.sidebar.expander("Discover new outside-watchlist candidates"):
-    st.write("Uses TMDb recommendations and similar-movie endpoints from your high-rated cached movies.")
-    per_seed = st.number_input("Candidates per seed", min_value=2, max_value=20, value=8, step=2)
-    seed_limit = st.number_input("High-rated seed movies", min_value=1, max_value=100, value=25, step=5)
-    if st.button("Discover from favorites"):
-        key = api_key_input or os.getenv("TMDB_API_KEY")
-        if not key:
-            st.error("Add a TMDb API key first.")
-        else:
-            meta = prepare_metadata(metadata)
-            ratings = data["ratings"].copy()
-            ratings["Rating"] = pd.to_numeric(ratings.get("Rating"), errors="coerce")
-            favorite_ids = set(ratings.loc[ratings["Rating"] >= 4.0, "movie_id"].dropna()) | set(data["likes"].get("movie_id", pd.Series(dtype=str)).dropna())
-            favorite_meta = meta[meta["movie_id"].isin(favorite_ids)].copy()
-            if "tmdb_popularity" in favorite_meta.columns:
-                favorite_meta = favorite_meta.sort_values("tmdb_popularity", ascending=False, na_position="last")
-            if favorite_meta.empty:
-                st.warning("Cache TMDb metadata for rated/liked movies first.")
-            else:
-                client = TMDbClient(api_key=key, cache_path=cache_path)
-                with st.spinner("Discovering and caching outside-watchlist candidates..."):
-                    discovered = discover_movies_from_favorites(favorite_meta, client=client, per_seed=int(per_seed), seed_limit=int(seed_limit))
-                    if use_database:
-                        import_tmdb_cache(cache_path=cache_path, db_path=db_path)
-                st.success(f"Discovered/cached {len(discovered)} candidate movies. Refreshing recommendations.")
-                st.rerun()
 
 ALL_MOODS = ["Tense", "Emotional", "Gritty", "Exciting", "Imaginative", "Light", "Reflective"]
 
+PAGES = ["Tonight's Pick", "Recommendations", "Curated Weeks", "Analysis", "Evaluation", "Reflection", "Data & Sync"]
+PAGE_ICONS = ["moon-stars", "bullseye", "calendar-week", "bar-chart", "clipboard-data", "chat-heart", "gear"]
+
+with st.sidebar:
+    page = option_menu(
+        menu_title=None,
+        options=PAGES,
+        icons=PAGE_ICONS,
+        default_index=0,
+        key="nav_menu",
+        styles={
+            "container": {"padding": "0!important", "background-color": "transparent"},
+            "icon": {"color": "#9A9AA2", "font-size": "15px"},
+            "nav-link": {
+                "font-size": "14px",
+                "font-weight": "500",
+                "text-align": "left",
+                "margin": "2px 0",
+                "padding": "10px 14px",
+                "border-radius": "8px",
+                "color": "#CFCFD6",
+                "--hover-color": "rgba(201,162,39,0.10)",
+            },
+            "nav-link-selected": {
+                "background-color": "rgba(201,162,39,0.16)",
+                "color": "#F5E6A8",
+                "font-weight": "700",
+            },
+        },
+    )
+
+st.sidebar.divider()
+st.sidebar.caption("THIS SESSION")
 mode_label = st.sidebar.radio(
     "Recommendation source",
     ["My watchlist", "Not on my watchlist"],
@@ -454,7 +452,7 @@ mode = "outside_watchlist" if mode_label == "Not on my watchlist" else "watchlis
 filter_values_preview = available_filter_values(pd.DataFrame())
 taste_mode = st.sidebar.selectbox("Taste mode", filter_values_preview.get("taste_modes", ["Balanced"]), index=0)
 
-with st.sidebar.expander("Scoring weights"):
+with st.sidebar.expander("Advanced scoring weights"):
     st.caption("Drag to change how much each signal pulls the final score.")
     content_weight = st.slider("Taste similarity", 0.0, 3.0, 1.0, 0.25, help="How strongly TF-IDF content similarity to your high-rated films affects the score.")
     theme_weight = st.slider("Theme similarity", 0.0, 3.0, 1.0, 0.25, help="How strongly conceptual/thematic similarity (what a film is *about* — keywords + overview) to your high-rated films affects the score. Independent of genre/director/cast.")
@@ -464,7 +462,12 @@ with st.sidebar.expander("Scoring weights"):
     feedback_weight = st.slider("Watched-movie feedback", 0.0, 3.0, 1.0, 0.25, help="How strongly the taste labels you give watched films (Analysis → Tune watched movies) pull recommendations toward or away from similar films. Deliberate tuning already counts more than passive feedback.")
 score_weights = {"content": content_weight, "theme": theme_weight, "entity": entity_weight, "list": list_weight, "anchor": anchor_weight, "feedback": feedback_weight}
 
-page = st.sidebar.radio("Page", ["Tonight's Pick", "Recommendations", "Analysis", "Evaluation", "Curated Weeks", "Database", "Sync status"])
+st.sidebar.divider()
+_sync_brief = sync_status()
+st.sidebar.caption(
+    f"🔄 {cached_count} cached · {'SQLite' if use_database else 'CSV/JSON'} backend · "
+    f"Last sync: {_sync_brief.get('last_sync_at', 'never')}"
+)
 
 recs, decade_prefs = build_recommendations(data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode, score_weights=score_weights)
 
@@ -491,44 +494,63 @@ def remove_feedback(movie_id: str, labels: list) -> None:
 
 
 def poster_card(row: pd.Series, idx: int) -> None:
-    title = f"{row.get('Name', '')} ({fmt_year(row.get('Year'))})"
-    _pu = row.get("poster_url")
-    if pd.notna(_pu) and str(_pu).strip():
-        st.image(str(_pu).strip(), use_container_width=True)
-    else:
-        st.info("No poster")
-    st.markdown(f"**{title}**")
-    directors = row.get("directors", [])
-    if isinstance(directors, list) and directors:
-        st.caption(f"Dir. {', '.join(directors[:2])}")
-    st.markdown(score_badge_html(float(row.get("score", 0) or 0)), unsafe_allow_html=True)
-    rt = row.get("runtime", "")
-    chip_items = [f"{rt} min"] if rt else []
-    genres = row.get("genres", [])
-    if isinstance(genres, list):
-        chip_items.extend(genres[:3])
-    mood_items = row.get("moods", [])
-    mood_items = mood_items[:2] if isinstance(mood_items, list) else []
-    if chip_items:
-        st.markdown(chips_html(chip_items), unsafe_allow_html=True)
-    if mood_items:
-        st.markdown(chips_html(mood_items, accent=True), unsafe_allow_html=True)
-    if row.get("why"):
-        st.caption(str(row.get("why")))
-    _disc = row.get("discovered_from")
-    if pd.notna(_disc) and str(_disc).strip():
-        st.caption(f"🔎 Discovered from: {str(_disc).strip()}")
-    with st.expander("Why?"):
-        render_reasons(row.get("why_details", row.get("why", "")))
-        if row.get("overview"):
-            st.write(row.get("overview"))
-    b1, b2 = st.columns(2)
-    if b1.button("More", key=f"more_{idx}_{row.get('movie_id')}"):
-        store_feedback(row["movie_id"], "more_like_this")
-        st.rerun()
-    if b2.button("Less", key=f"less_{idx}_{row.get('movie_id')}"):
-        store_feedback(row["movie_id"], "less_like_this")
-        st.rerun()
+    with stylable_container(
+        key=f"poster_card_{idx}_{row.get('movie_id')}",
+        css_styles="""
+        {
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 14px;
+            padding: 14px 14px 10px 14px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.012));
+            box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+            transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+
+            &:hover {
+                transform: translateY(-3px);
+                border-color: rgba(201,162,39,0.35);
+                box-shadow: 0 14px 32px rgba(0,0,0,0.5);
+            }
+        }
+        """,
+    ):
+        title = f"{row.get('Name', '')} ({fmt_year(row.get('Year'))})"
+        _pu = row.get("poster_url")
+        if pd.notna(_pu) and str(_pu).strip():
+            st.image(str(_pu).strip(), use_container_width=True)
+        else:
+            st.info("No poster")
+        st.markdown(f"**{title}**")
+        directors = row.get("directors", [])
+        if isinstance(directors, list) and directors:
+            st.caption(f"Dir. {', '.join(directors[:2])}")
+        st.markdown(score_badge_html(float(row.get("score", 0) or 0)), unsafe_allow_html=True)
+        rt = row.get("runtime", "")
+        chip_items = [f"{rt} min"] if rt else []
+        genres = row.get("genres", [])
+        if isinstance(genres, list):
+            chip_items.extend(genres[:3])
+        mood_items = row.get("moods", [])
+        mood_items = mood_items[:2] if isinstance(mood_items, list) else []
+        if chip_items:
+            st.markdown(chips_html(chip_items), unsafe_allow_html=True)
+        if mood_items:
+            st.markdown(chips_html(mood_items, accent=True), unsafe_allow_html=True)
+        if row.get("why"):
+            st.caption(str(row.get("why")))
+        _disc = row.get("discovered_from")
+        if pd.notna(_disc) and str(_disc).strip():
+            st.caption(f"🔎 Discovered from: {str(_disc).strip()}")
+        with st.expander("Why?"):
+            render_reasons(row.get("why_details", row.get("why", "")))
+            if row.get("overview"):
+                st.write(row.get("overview"))
+        b1, b2 = st.columns(2)
+        if b1.button("More", key=f"more_{idx}_{row.get('movie_id')}"):
+            store_feedback(row["movie_id"], "more_like_this")
+            st.rerun()
+        if b2.button("Less", key=f"less_{idx}_{row.get('movie_id')}"):
+            store_feedback(row["movie_id"], "less_like_this")
+            st.rerun()
 
 
 def curated_week_card(row: pd.Series) -> None:
@@ -706,11 +728,15 @@ if page == "Tonight's Pick":
         )
     with tp2:
         _time_options = {"Any length": None, "Under 100 min": (0, 100), "Under 2 hours": (0, 120), "Under 3 hours": (0, 180)}
-        tonight_time_label = st.radio("Time available", list(_time_options.keys()), horizontal=True, key="tonight_time")
-        tonight_runtime = _time_options[tonight_time_label]
+        tonight_time_label = st.segmented_control(
+            "Time available", list(_time_options.keys()), default="Any length", key="tonight_time",
+        )
+        tonight_runtime = _time_options.get(tonight_time_label)
 
-    with st.expander("Not in the mood for...", expanded=False):
-        tonight_avoid = st.multiselect("Avoid these moods", ALL_MOODS, key="tonight_avoid_moods")
+    with st.popover("Not in the mood for..."):
+        tonight_avoid = st.segmented_control(
+            "Avoid these moods", ALL_MOODS, selection_mode="multi", default=[], key="tonight_avoid_moods",
+        ) or []
 
     if "tonight_skipped" not in st.session_state:
         st.session_state.tonight_skipped = []
@@ -805,7 +831,7 @@ elif page == "Recommendations":
     # --- Anchor film ---
     anchor_movie_id = None
     anchor_focus = True
-    with st.expander("Anchor on a film", expanded=False):
+    with st.popover("Anchor on a film"):
         st.caption("Pick a film you love and the engine will boost candidates that are thematically similar to it.")
         if metadata.empty:
             st.info("Fetch TMDb metadata first to enable film anchoring.")
@@ -831,9 +857,9 @@ elif page == "Recommendations":
                     st.caption(f"Boosting candidates thematically similar to: **{anchor_choice}**")
 
     # --- Mood avoidance ---
-    with st.expander("Not in the mood for...", expanded=False):
+    with st.popover("Not in the mood for..."):
         st.caption("Temporarily penalise these moods in this session. No permanent feedback saved.")
-        avoid_moods = st.multiselect("Avoid tonight", ALL_MOODS)
+        avoid_moods = st.segmented_control("Avoid tonight", ALL_MOODS, selection_mode="multi", default=[], key="avoid_moods_rec") or []
 
     # Re-run scoring if anchor or mood avoidance is active
     if anchor_movie_id or avoid_moods:
@@ -866,7 +892,7 @@ elif page == "Recommendations":
     mood_note = f" | Avoiding: {', '.join(avoid_moods)}" if avoid_moods else ""
     st.caption(f"Showing {min(100, len(filtered))} of {len(filtered)} recommendations. Taste mode: {taste_mode}{anchor_note}{mood_note}.")
 
-    view = st.radio("View", ["Poster cards", "Table"], horizontal=True)
+    view = st.segmented_control("View", ["Poster cards", "Table"], default="Poster cards", key="rec_view") or "Poster cards"
     if view == "Poster cards":
         top = filtered.head(12).reset_index(drop=True)
         for start in range(0, len(top), 4):
@@ -879,7 +905,7 @@ elif page == "Recommendations":
     else:
         show_cols = ["Name", "Year", "score", "heuristic_score", "content_score", "theme_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "mood_penalty", "why", "Letterboxd URI"]
         show_cols += [c for c in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "discovered_from"] if c in filtered.columns]
-        st.dataframe(filtered[show_cols].head(100), use_container_width=True, hide_index=True)
+        render_grid(filtered[show_cols].head(100))
 
     details_frame = filtered.head(100)[["Name", "Year", "movie_id", "why", "why_details", "list_names_full", "taste_matches_full"]].copy()
     if not details_frame.empty:
@@ -1137,7 +1163,7 @@ elif page == "Evaluation":
             fig = px.scatter(eval_df, x="predicted_rating", y="Rating", hover_data=["Name", "Year"])
             st.warning("Optional package `statsmodels` not installed, so the trendline is hidden.")
         st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(eval_df, use_container_width=True, hide_index=True)
+        render_grid(eval_df)
         st.write(
             "This holdout test hides about 20% of rated movies, builds a profile from the rest, and checks whether the hidden movies you rated highly rise to the top. "
             "Ranking metrics are more useful than MAE for recommender quality."
@@ -1284,45 +1310,173 @@ elif page == "Curated Weeks":
                                         with st.container(border=True):
                                             curated_week_card(lrow)
 
-elif page == "Database":
-    st.subheader("SQLite database")
-    status = database_status(db_path)
-    if not status.get("exists"):
-        st.warning("Database does not exist yet. Use the sidebar button to build it from your local files.")
-    else:
-        st.json(status)
-        st.write("The app reads from SQLite when `data/movie_recommender.sqlite` exists. CSV/JSON/RSS remain ingestion sources.")
-        if st.button("Import latest TMDb cache into database"):
-            count = import_tmdb_cache(cache_path=cache_path, db_path=db_path)
-            st.success(f"Imported {count} metadata rows.")
-            st.rerun()
-        if st.button("Import latest Letterboxd export into database"):
-            result = import_letterboxd_export(export_zip=export_zip, db_path=db_path)
-            st.success("Imported latest export.")
+elif page == "Reflection":
+    _tmdb_key = get_tmdb_api_key()
+    _reflection_client = TMDbClient(api_key=_tmdb_key, cache_path=cache_path) if _tmdb_key else None
+    render_reflection_panel(
+        data, metadata, tmdb_client=_reflection_client,
+        db_path=db_path, use_database=use_database, cache_path=cache_path,
+    )
+
+else:  # "Data & Sync"
+    st.subheader("Data & Sync")
+    st.caption("TMDb metadata caching, Letterboxd sync, and the SQLite backend — set these up once, then check back occasionally.")
+
+    dm1, dm2, dm3, dm4 = st.columns(4)
+    dm1.metric("Cached movies", cached_count)
+    dm2.metric("Known-profile cached", known_count)
+    dm3.metric("TMDb matches", found_count)
+    dm4.metric("Backend", "SQLite" if use_database else "CSV/JSON")
+
+    tab_tmdb, tab_sync, tab_db = st.tabs(["TMDb metadata", "Letterboxd sync", "SQLite database"])
+
+    with tab_tmdb:
+        st.text_input(
+            "TMDb API key",
+            value=os.getenv("TMDB_API_KEY", ""),
+            type="password",
+            key="tmdb_api_key_input",
+            help="Optional. You can also set TMDB_API_KEY in your environment or Streamlit secrets.",
+        )
+        with st.expander("Enrich known Letterboxd movies", expanded=True):
+            st.write("Repeated runs skip already cached movies unless refresh is enabled.")
+            limit = st.number_input("Uncached movies to fetch this run", min_value=1, max_value=max(1, int(len(all_movies))), value=min(50, int(len(all_movies))), step=25)
+            force = st.checkbox("Refresh existing cached movies", value=False)
+            if st.button("Fetch TMDb metadata"):
+                key = get_tmdb_api_key()
+                if not key:
+                    st.error("Add a TMDb API key first.")
+                else:
+                    client = TMDbClient(api_key=key, cache_path=cache_path)
+                    with st.spinner("Fetching and caching TMDb metadata..."):
+                        result = enrich_movies(all_movies, client=client, limit=int(limit), force=force)
+                        if use_database:
+                            import_tmdb_cache(cache_path=cache_path, db_path=db_path)
+                    st.success(f"Fetched or refreshed {len(result)} movies. Refreshing recommendations.")
+                    st.rerun()
+
+        with st.expander("Discover new outside-watchlist candidates"):
+            st.write("Uses TMDb recommendations and similar-movie endpoints from your high-rated cached movies.")
+            per_seed = st.number_input("Candidates per seed", min_value=2, max_value=20, value=8, step=2)
+            seed_limit = st.number_input("High-rated seed movies", min_value=1, max_value=100, value=25, step=5)
+            if st.button("Discover from favorites"):
+                key = get_tmdb_api_key()
+                if not key:
+                    st.error("Add a TMDb API key first.")
+                else:
+                    meta = prepare_metadata(metadata)
+                    ratings = data["ratings"].copy()
+                    ratings["Rating"] = pd.to_numeric(ratings.get("Rating"), errors="coerce")
+                    favorite_ids = set(ratings.loc[ratings["Rating"] >= 4.0, "movie_id"].dropna()) | set(data["likes"].get("movie_id", pd.Series(dtype=str)).dropna())
+                    favorite_meta = meta[meta["movie_id"].isin(favorite_ids)].copy()
+                    if "tmdb_popularity" in favorite_meta.columns:
+                        favorite_meta = favorite_meta.sort_values("tmdb_popularity", ascending=False, na_position="last")
+                    if favorite_meta.empty:
+                        st.warning("Cache TMDb metadata for rated/liked movies first.")
+                    else:
+                        client = TMDbClient(api_key=key, cache_path=cache_path)
+                        with st.spinner("Discovering and caching outside-watchlist candidates..."):
+                            discovered = discover_movies_from_favorites(favorite_meta, client=client, per_seed=int(per_seed), seed_limit=int(seed_limit))
+                            if use_database:
+                                import_tmdb_cache(cache_path=cache_path, db_path=db_path)
+                        st.success(f"Discovered/cached {len(discovered)} candidate movies. Refreshing recommendations.")
+                        st.rerun()
+
+        with st.expander("Command-line enrichment"):
+            st.code("export TMDB_API_KEY='your_key_here'\nexport LETTERBOXD_USERNAME='your_username'\npython sync_letterboxd.py $LETTERBOXD_USERNAME --status\npython enrich_tmdb.py --limit 100\npython enrich_tmdb.py", language="bash")
+
+    with tab_sync:
+        sync_stat = sync_status()
+        st.caption(f"RSS events: {sync_stat.get('rss_events', 0)} | Last sync: {sync_stat.get('last_sync_at', 'never')}")
+
+        with st.expander("Sync recent activity from RSS", expanded=True):
+            st.write("RSS updates recent watches, diary entries, rewatches, and ratings that appear in your public activity feed. Use a fresh export for full watchlist state and old rating edits.")
+            lb_username = st.text_input("Letterboxd username or RSS URL", value=os.getenv("LETTERBOXD_USERNAME", ""), help="Example: bslinky or https://letterboxd.com/bslinky/rss/")
+            if st.button("Sync Letterboxd RSS"):
+                if not lb_username:
+                    st.error("Add your Letterboxd username or RSS URL first.")
+                else:
+                    with st.spinner("Fetching Letterboxd RSS..."):
+                        result = sync_rss(lb_username)
+                    if use_database:
+                        with st.spinner("Applying synced events to database..."):
+                            apply_rss_overlays_to_db(db_path=db_path)
+                    new_ev = result.get("new_events", 0)
+                    st.success(
+                        f"Fetched {result.get('fetched_events', 0)} events; "
+                        f"{new_ev} new."
+                        + (" Database updated." if use_database else "")
+                    )
+                    # Persist username to .env so auto-sync works next session.
+                    if _DOTENV_AVAILABLE and lb_username != os.getenv("LETTERBOXD_USERNAME", ""):
+                        try:
+                            _env_file = find_dotenv(usecwd=True) or ".env"
+                            set_key(_env_file, "LETTERBOXD_USERNAME", lb_username)
+                        except Exception:
+                            pass
+                    st.rerun()
+
+        with st.expander("Replace with fresh Letterboxd export"):
+            st.write("Use this when you want authoritative updates for watchlist removals/additions, old rating edits, deleted ratings, and historical changes not present in RSS.")
+            uploaded_export = st.file_uploader("Upload latest Letterboxd export zip", type=["zip"])
+            if uploaded_export is not None and st.button("Install uploaded export"):
+                export_zip.parent.mkdir(parents=True, exist_ok=True)
+                export_zip.write_bytes(uploaded_export.getbuffer())
+                # Force re-extraction next run.
+                if Path("data/letterboxd").exists():
+                    import shutil
+                    shutil.rmtree(Path("data/letterboxd"))
+                if use_database:
+                    with st.spinner("Rebuilding database from new export..."):
+                        rebuild_database(export_zip=export_zip, cache_path=cache_path, db_path=db_path)
+                    st.success("Installed new Letterboxd export and rebuilt database.")
+                else:
+                    st.success("Installed latest Letterboxd export. Refreshing data.")
+                st.rerun()
+
+        st.divider()
+        st.caption("Sync overlay detail")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("RSS events", int(sync_stat.get("rss_events", 0)))
+        s2.metric("Watched overlay", int(sync_stat.get("watched_overlay", 0)))
+        s3.metric("Ratings overlay", int(sync_stat.get("ratings_overlay", 0)))
+        s4.metric("Diary overlay", int(sync_stat.get("diary_overlay", 0)))
+        st.info("RSS sync is incremental and best for recent activity. A fresh Letterboxd export is still the source of truth for complete watchlist state, old rating edits, deleted ratings, and historical backfills.")
+        for label, path in {
+            "Recent RSS events": Path("data/sync/rss_events.csv"),
+            "Rating changes overlay": Path("data/sync/ratings_overlay.csv"),
+            "Watched overlay": Path("data/sync/watched_overlay.csv"),
+            "Diary / rewatches overlay": Path("data/sync/diary_overlay.csv"),
+        }.items():
+            with st.expander(label):
+                if path.exists():
+                    st.dataframe(pd.read_csv(path).tail(100), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No data yet.")
+
+    with tab_db:
+        st.write("Use SQLite as the app backend for analysis, history, rating changes, rewatches, metadata, and feedback.")
+        if st.button("Build / refresh database from local files"):
+            with st.spinner("Importing Letterboxd export, TMDb cache, and feedback into SQLite..."):
+                result = rebuild_database(export_zip=export_zip, cache_path=cache_path, db_path=db_path)
+            st.success("Database rebuilt.")
             st.json(result)
             st.rerun()
+        st.caption(f"Database path: {db_path}")
 
-else:
-    st.subheader("Letterboxd sync status")
-    status = sync_status()
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("RSS events", int(status.get("rss_events", 0)))
-    s2.metric("Watched overlay", int(status.get("watched_overlay", 0)))
-    s3.metric("Ratings overlay", int(status.get("ratings_overlay", 0)))
-    s4.metric("Diary overlay", int(status.get("diary_overlay", 0)))
-    st.write("Last sync:", status.get("last_sync_at", "never"))
-    st.info("RSS sync is incremental and best for recent activity. A fresh Letterboxd export is still the source of truth for complete watchlist state, old rating edits, deleted ratings, and historical backfills.")
-    for label, path in {
-        "Recent RSS events": Path("data/sync/rss_events.csv"),
-        "Rating changes overlay": Path("data/sync/ratings_overlay.csv"),
-        "Watched overlay": Path("data/sync/watched_overlay.csv"),
-        "Diary / rewatches overlay": Path("data/sync/diary_overlay.csv"),
-    }.items():
-        with st.expander(label):
-            if path.exists():
-                st.dataframe(pd.read_csv(path).tail(100), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No data yet.")
-
-with st.expander("Command-line enrichment"):
-    st.code("export TMDB_API_KEY='your_key_here'\nexport LETTERBOXD_USERNAME='your_username'\npython sync_letterboxd.py $LETTERBOXD_USERNAME --status\npython enrich_tmdb.py --limit 100\npython enrich_tmdb.py", language="bash")
+        st.divider()
+        db_status = database_status(db_path)
+        if not db_status.get("exists"):
+            st.warning("Database does not exist yet. Use the button above to build it from your local files.")
+        else:
+            st.json(db_status)
+            st.write("The app reads from SQLite when `data/movie_recommender.sqlite` exists. CSV/JSON/RSS remain ingestion sources.")
+            if st.button("Import latest TMDb cache into database"):
+                count = import_tmdb_cache(cache_path=cache_path, db_path=db_path)
+                st.success(f"Imported {count} metadata rows.")
+                st.rerun()
+            if st.button("Import latest Letterboxd export into database"):
+                result = import_letterboxd_export(export_zip=export_zip, db_path=db_path)
+                st.success("Imported latest export.")
+                st.json(result)
+                st.rerun()

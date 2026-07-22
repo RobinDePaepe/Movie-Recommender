@@ -15,8 +15,14 @@ from sklearn.metrics.pairwise import cosine_similarity
 import theme_similarity
 
 FEEDBACK_PATH = Path("data/feedback.csv")
-LIST_SCORE_SCALE = 0.4
-LIST_COUNT_WEIGHT = 0.15
+LIST_SCORE_SCALE = 0.25
+LIST_COUNT_WEIGHT = 0.1
+# Being in many curated lists ("Top 250", "canon", "masterworks"...) shouldn't let list
+# membership alone outscore genuine content/theme similarity — cap the raw stacked score
+# before scaling so it stays a boost/tie-breaker rather than the dominant signal. See the
+# 2026-07-10 ground-truth ranking exercise in testing-feedback.md: several 4-5★ films with
+# negative content+theme scores still ranked in the top 5% purely on stacked list signal.
+LIST_SCORE_CAP = 6.0
 # The heuristic (decade/recency/liked) is a tie-breaker, not the dominant signal:
 # only its deviation from the 3.0 floor feeds the final score, damped by this weight.
 HEURISTIC_WEIGHT = 0.5
@@ -318,7 +324,7 @@ def add_heuristic_scores(candidates: pd.DataFrame, data: Dict[str, pd.DataFrame]
     )
     out[["list_score", "list_count"]] = out[["list_score", "list_count"]].fillna(0)
     out["list_names"] = out["list_names"].fillna("")
-    out["list_contribution"] = (out["list_score"] * LIST_SCORE_SCALE) + (out["list_count"].clip(upper=5) * LIST_COUNT_WEIGHT)
+    out["list_contribution"] = (out["list_score"].clip(upper=LIST_SCORE_CAP) * LIST_SCORE_SCALE) + (out["list_count"].clip(upper=5) * LIST_COUNT_WEIGHT)
     out["heuristic_score"] = 3.0 + out["decade_score"] + out["liked_decade_bonus"] + out["recency_bonus"] + out["list_contribution"]
     return out, decade_pref.sort_values("decade")
 
