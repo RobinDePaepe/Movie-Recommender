@@ -26,6 +26,8 @@ except ImportError:
     _DOTENV_AVAILABLE = False
 
 from curator import CURATION_STYLES, anchor_options, build_curated_list
+import llm_curator
+import llm_providers
 from rate_review import render_reflection_panel
 from recommender import (
     ANCHOR_FOCUS_SCALE,
@@ -582,6 +584,52 @@ def curated_week_card(row: pd.Series) -> None:
                 st.write(row.get("overview"))
         tmdb_url = row.get("tmdb_url")
         if isinstance(tmdb_url, str) and tmdb_url:
+            st.link_button("Open in TMDb", tmdb_url)
+
+
+def enrich_llm_pick(pick: dict, client: "TMDbClient | None") -> dict:
+    """Look up poster/overview/runtime for an LLM-suggested title via TMDb."""
+    if client is None:
+        return {}
+    try:
+        year = pick.get("year")
+        year = int(year) if year not in (None, "", 0) else None
+        rec = client.fetch_movie_metadata(pick.get("title", ""), year)
+        return rec if isinstance(rec, dict) and rec.get("tmdb_found") else {}
+    except Exception:
+        return {}
+
+
+def llm_pick_card(pick: dict, meta: dict, digest: "llm_curator.TasteDigest | None") -> None:
+    cat = llm_curator.CATEGORIES.get(pick.get("category"), {"label": pick.get("category", ""), "accent": "#E8B04B"})
+    title = pick.get("title", "")
+    director = pick.get("director") or (", ".join(meta.get("directors", [])[:2]) if meta.get("directors") else "")
+    year = pick.get("year") or meta.get("year") or ""
+    poster = meta.get("poster_url")
+    is_seen = bool(digest and digest.loaded and llm_curator._norm_title(title) in digest.seen_keys)
+
+    left, right = st.columns([1, 4])
+    with left:
+        if poster:
+            st.image(poster, use_container_width=True)
+        else:
+            st.info("No poster")
+    with right:
+        st.caption(cat["label"].upper())
+        seen_tag = "  ·  ✓ already seen" if (is_seen and pick.get("category") != "rewatch") else ""
+        st.markdown(f"### {title} ({fmt_year(year)}){seen_tag}")
+        if director:
+            st.caption(f"Dir. {director}")
+        if pick.get("reason"):
+            st.write(pick.get("reason"))
+        if meta.get("overview"):
+            with st.expander("Overview", expanded=False):
+                st.write(meta.get("overview"))
+        runtime = meta.get("runtime")
+        if runtime:
+            st.caption(f"Runtime: {runtime} min")
+        tmdb_url = meta.get("tmdb_url")
+        if tmdb_url:
             st.link_button("Open in TMDb", tmdb_url)
 
 
@@ -1171,6 +1219,146 @@ elif page == "Evaluation":
 
 elif page == "Curated Weeks":
     st.subheader("Curated movie week")
+    cw_mode = st.radio(
+        "Curation engine",
+        ["Your library (deterministic)", "AI discovery (web search)"],
+        horizontal=True,
+        help=(
+            "Your library scores movies already in your Letterboxd/TMDb data. "
+            "AI discovery asks Claude to build a themed week around any film — including "
+            "titles you've never logged and brand-new releases verified via web search."
+        ),
+    )
+
+    if cw_mode == "AI discovery (web search)":
+        st.write(
+            "Give one anchor film. The model builds a week of 4–5 connected films — a classic, "
+            "a thematic match, optionally the same director, a recent (web-verified) title, and a "
+            "rewatch — tuned to your Letterboxd taste."
+        )
+
+        digest = llm_curator.build_taste_digest(data)
+        if digest.loaded:
+            mean_txt = f" · avg {digest.mean:.2f}" if digest.mean is not None else ""
+            st.caption(f"✓ Taste signal from your library: {digest.count} logged{mean_txt} · {len(digest.top)} top films")
+        else:
+            st.caption("No local ratings found — the model will curate from the anchor alone.")
+
+        _prov_keys = list(llm_providers.PROVIDERS.keys())
+        _default_prov = llm_providers.DEFAULT_PROVIDER if llm_providers.DEFAULT_PROVIDER in _prov_keys else _prov_keys[0]
+        prov_col, _ = st.columns([1, 1])
+        with prov_col:
+            llm_provider = st.selectbox(
+                "Provider",
+                _prov_keys,
+                index=_prov_keys.index(_default_prov),
+                format_func=lambda k: llm_providers.PROVIDERS[k].label,
+                key="llm_provider",
+            )
+        _spec = llm_providers.PROVIDERS[llm_provider]
+        _prov_ready = _spec.ready
+        _search_ok = _spec.supports_search
+        st.caption(
+            f"Model: `{_spec.model()}` · web verification of recent films: "
+            + ("enabled" if _search_ok else "not available on this provider (recent picks unverified)")
+        )
+        if not _prov_ready:
+            st.warning(
+                f"No API key for {_spec.label}. Set one of `{'`, `'.join(_spec.api_key_env)}` "
+                "in your environment or `.env`."
+            )
+
+        anchor_text = st.text_input("Anchor film", placeholder="e.g. Whiplash (2014)", key="llm_anchor")
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            llm_seen = st.checkbox("Already seen (= rewatch)", value=True, key="llm_seen")
+        with c2:
+            llm_director = st.checkbox("Director pick", value=True, key="llm_director")
+        with c3:
+            llm_era = st.selectbox("Classic pick", ["before 1980", "before 1970"], key="llm_era")
+        llm_taste = st.text_area(
+            "Taste note (optional)",
+            placeholder="e.g. loves procedural/competence dramas, obsession stories; avoid pure comedy.",
+            key="llm_taste",
+        )
+
+        _era_val = "1970" if "1970" in llm_era else "1980"
+
+        if st.button("Compose the week", disabled=not (anchor_text.strip() and _prov_ready)):
+            st.session_state.pop("llm_week", None)
+            st.session_state["llm_rejected"] = {}
+            with st.spinner("Programming your week…"):
+                try:
+                    st.session_state["llm_week"] = llm_curator.generate_filmweek(
+                        anchor=anchor_text,
+                        seen=llm_seen,
+                        era=_era_val,
+                        with_director=llm_director,
+                        taste_note=llm_taste,
+                        digest=digest,
+                        provider=llm_provider,
+                        search_enabled=_search_ok,
+                    )
+                except Exception as exc:  # noqa: BLE001 — surface any API/parse error to the user
+                    st.error(str(exc))
+
+        week = st.session_state.get("llm_week")
+        if week:
+            _tmdb_key = get_tmdb_api_key()
+            _client = TMDbClient(api_key=_tmdb_key, cache_path=cache_path) if _tmdb_key else None
+            a = week.get("anchor", {})
+            st.divider()
+            st.markdown(f"#### ★ Anchor: {a.get('title') or anchor_text}")
+            meta_bits = " · ".join(str(x) for x in [a.get("year"), a.get("director")] if x)
+            if meta_bits:
+                st.caption(meta_bits)
+            if a.get("note"):
+                st.caption(f"_{a.get('note')}_")
+
+            for pick in week.get("picks", []):
+                meta = enrich_llm_pick(pick, _client)
+                with st.container(border=True):
+                    llm_pick_card(pick, meta, digest)
+                    b1, b2, _ = st.columns([1, 1, 3])
+                    rejected = st.session_state.setdefault("llm_rejected", {})
+                    cat = pick.get("category")
+
+                    def _resim(mode: str, _pick=pick, _cat=cat):
+                        shown = [p["title"] for p in week["picks"] if p.get("category") == _cat]
+                        excl = list(dict.fromkeys(shown + rejected.get(_cat, [])))
+                        with st.spinner("Searching…"):
+                            try:
+                                new_pick = llm_curator.resimulate_pick(
+                                    category=_cat,
+                                    anchor_title=a.get("title") or anchor_text,
+                                    anchor_year=a.get("year"),
+                                    anchor_director=a.get("director", ""),
+                                    era=_era_val,
+                                    taste_note=llm_taste,
+                                    digest=digest,
+                                    exclude_titles=excl,
+                                    provider=llm_provider,
+                                    search_enabled=_search_ok,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                st.error(str(exc))
+                                return
+                        picks = week["picks"]
+                        idx = next((i for i, p in enumerate(picks) if p["_id"] == _pick["_id"]), None)
+                        if mode == "replace" and idx is not None:
+                            rejected.setdefault(_cat, []).append(_pick["title"])
+                            picks[idx] = new_pick
+                        else:
+                            insert_at = max((i for i, p in enumerate(picks) if p.get("category") == _cat), default=len(picks) - 1) + 1
+                            picks.insert(insert_at, new_pick)
+                        st.rerun()
+
+                    if b1.button("↻ Another", key=f"reroll_{pick['_id']}"):
+                        _resim("replace")
+                    if b2.button("+ Add one", key=f"add_{pick['_id']}"):
+                        _resim("add")
+        st.stop()
+
     st.write("Build an ordered watchlist around one anchor movie using your watched, rated, and watchlist history plus TMDb metadata.")
 
     if metadata.empty:
