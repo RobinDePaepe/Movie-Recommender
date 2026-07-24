@@ -15,8 +15,14 @@ from sklearn.metrics.pairwise import cosine_similarity
 import theme_similarity
 
 FEEDBACK_PATH = Path("data/feedback.csv")
-LIST_SCORE_SCALE = 0.4
-LIST_COUNT_WEIGHT = 0.15
+LIST_SCORE_SCALE = 0.25
+LIST_COUNT_WEIGHT = 0.1
+# Being in many curated lists ("Top 250", "canon", "masterworks"...) shouldn't let list
+# membership alone outscore genuine content/theme similarity — cap the raw stacked score
+# before scaling so it stays a boost/tie-breaker rather than the dominant signal. See the
+# 2026-07-10 ground-truth ranking exercise in testing-feedback.md: several 4-5★ films with
+# negative content+theme scores still ranked in the top 5% purely on stacked list signal.
+LIST_SCORE_CAP = 6.0
 # The heuristic (decade/recency/liked) is a tie-breaker, not the dominant signal:
 # only its deviation from the 3.0 floor feeds the final score, damped by this weight.
 HEURISTIC_WEIGHT = 0.5
@@ -318,9 +324,45 @@ def add_heuristic_scores(candidates: pd.DataFrame, data: Dict[str, pd.DataFrame]
     )
     out[["list_score", "list_count"]] = out[["list_score", "list_count"]].fillna(0)
     out["list_names"] = out["list_names"].fillna("")
-    out["list_contribution"] = (out["list_score"] * LIST_SCORE_SCALE) + (out["list_count"].clip(upper=5) * LIST_COUNT_WEIGHT)
+    out["list_contribution"] = (out["list_score"].clip(upper=LIST_SCORE_CAP) * LIST_SCORE_SCALE) + (out["list_count"].clip(upper=5) * LIST_COUNT_WEIGHT)
     out["heuristic_score"] = 3.0 + out["decade_score"] + out["liked_decade_bonus"] + out["recency_bonus"] + out["list_contribution"]
     return out, decade_pref.sort_values("decade")
+
+
+def _unreleased_ids(candidates: pd.DataFrame, meta: pd.DataFrame) -> set:
+    """movie_ids that shouldn't be recommended because they haven't released yet.
+
+    Two signals, since TMDb enrichment coverage is incomplete (see CLAUDE.md coverage note):
+    - Metadata found: trust TMDb's release_date (or its absence) precisely.
+    - No metadata at all: fall back to the Letterboxd-supplied Year. A future year is a
+      clear signal either way; a same-year film with no TMDb match at all is *also* treated
+      as unreleased, since in practice that combination is almost always a franchise/
+      anticipated title TMDb can't fuzzy-match yet, not an obscure already-out film. Running
+      "Enrich known Letterboxd movies" resolves the ambiguity once real metadata lands.
+    """
+    if candidates.empty or "movie_id" not in candidates.columns:
+        return set()
+    if meta.empty or "movie_id" not in meta.columns or "tmdb_release_date" not in meta.columns:
+        # No TMDb-shaped release info to reason about at all (e.g. metadata that was never
+        # enriched, or a caller passing a bare feature frame) — nothing to flag.
+        return set()
+
+    today = pd.Timestamp.today().normalize()
+    current_year = today.year
+    info = meta.set_index("movie_id")
+    found = info.get("tmdb_found", pd.Series(False, index=info.index)).fillna(False).astype(bool)
+    release_dates = pd.to_datetime(info["tmdb_release_date"], errors="coerce")
+    release_unreleased_ids = set(info.index[found & (release_dates.isna() | (release_dates > today))])
+
+    # movie_ids TMDb enrichment has ever touched (found a match or confirmed no match) —
+    # anything outside this set is simply un-enriched, not necessarily unreleased.
+    known_ids = set(info.index)
+    cand = candidates.drop_duplicates("movie_id").set_index("movie_id")
+    cand_year = pd.to_numeric(cand.get("Year"), errors="coerce")
+    no_metadata_mask = ~cand_year.index.isin(known_ids)
+    guess_unreleased_ids = set(cand_year.index[(cand_year >= current_year) & no_metadata_mask])
+
+    return release_unreleased_ids | guess_unreleased_ids
 
 
 def build_taste_profile(positive_meta: pd.DataFrame, top_n: int = 12) -> Dict[str, List[str]]:
@@ -641,6 +683,11 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
         extra = outside[["Name", "Year", "movie_id", "tmdb_url"]].copy()
         extra["Letterboxd URI"] = ""
         candidates = pd.concat([candidates, extra], ignore_index=True, sort=False).drop_duplicates("movie_id")
+    # Neither TMDb-discovered candidates nor your own watchlist should recommend a film
+    # you can't actually watch yet — "Dune: Part Three", untitled announced projects, etc.
+    unreleased = _unreleased_ids(candidates, meta)
+    if unreleased:
+        candidates = candidates[~candidates["movie_id"].isin(unreleased)]
     candidates, decade_prefs = add_heuristic_scores(candidates, data)
     candidates, taste_profile = add_content_similarity(candidates, data["ratings"], data["likes"], metadata if metadata is not None else pd.DataFrame())
     candidates = add_feedback_similarity(candidates, feedback if feedback is not None else pd.DataFrame(), metadata)

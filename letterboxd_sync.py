@@ -86,12 +86,15 @@ def _parse_rating(raw: str) -> float | None:
 
 
 def _title_year_from_title(title: str) -> Tuple[str, int | None]:
-    # Common examples include: "Film Title, 1999 - ★★★½" or "Film Title, 1999"
+    # Common examples include: "Film Title, 1999 - ★★★½" or "Film Title, 1999".
+    # Only diary/watched items are shaped like this; list-created/updated and other
+    # non-film RSS activity (e.g. "2026 Ranked") has no trailing ", <year>" and must
+    # be rejected here rather than misparsed as a film with no year.
     cleaned = re.sub(r"\s+-\s+[★½0-9. /]+.*$", "", title or "").strip()
     match = re.match(r"^(.*?),\s*(\d{4})$", cleaned)
     if match:
         return match.group(1).strip(), int(match.group(2))
-    return cleaned.strip(), None
+    return "", None
 
 
 def _movie_id(name: str, year: Any) -> str:

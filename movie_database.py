@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import pandas as pd
 
@@ -146,6 +146,15 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
                 message TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS reflections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                movie_id TEXT REFERENCES movies(movie_id) ON DELETE CASCADE,
+                category TEXT NOT NULL,
+                rating REAL NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS curated_weeks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 anchor_movie_id TEXT NOT NULL,
@@ -160,6 +169,7 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_watched_movie ON watched_events(movie_id);
             CREATE INDEX IF NOT EXISTS idx_ratings_rating ON ratings(rating);
             CREATE INDEX IF NOT EXISTS idx_metadata_tmdb_id ON movie_metadata(tmdb_id);
+            CREATE INDEX IF NOT EXISTS idx_reflections_movie ON reflections(movie_id);
             """
         )
         # Migration: add feedback.scope to databases created before scope tracking existed.
@@ -538,3 +548,73 @@ def remove_feedback_from_db(movie_id_value: str, labels: list, db_path: str | Pa
     with connect(db_path) as conn:
         for label in labels:
             conn.execute("DELETE FROM feedback WHERE movie_id=? AND feedback=?", (movie_id_value, label))
+
+
+def save_reflection(
+    movie_id_value: str,
+    name: str,
+    year: Any,
+    category_ratings: Dict[str, Tuple[float, str]],
+    overall_rating: float,
+    overall_note: str = "",
+    db_path: str | Path = DB_PATH,
+) -> None:
+    """Append category sub-ratings + notes and an overall rating for a film.
+
+    Append-only (mirrors rating_history) — re-reflecting after a rewatch adds new rows rather
+    than overwriting old ones. Also upserts the film's official rating in `ratings`, logging to
+    `rating_history` only when the value actually changes.
+    """
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        mid = upsert_movie(conn, name, year)
+        for category, (rating, note) in category_ratings.items():
+            conn.execute(
+                "INSERT INTO reflections(movie_id, category, rating, note, created_at) VALUES (?, ?, ?, ?, ?)",
+                (mid, category, float(rating), note or "", now),
+            )
+        conn.execute(
+            "INSERT INTO reflections(movie_id, category, rating, note, created_at) VALUES (?, ?, ?, ?, ?)",
+            (mid, "Overall", float(overall_rating), overall_note or "", now),
+        )
+
+        old = conn.execute("SELECT rating FROM ratings WHERE movie_id=?", (mid,)).fetchone()
+        if old is not None and old["rating"] != float(overall_rating):
+            conn.execute(
+                "INSERT INTO rating_history(movie_id, old_rating, new_rating, changed_at, source) VALUES (?, ?, ?, ?, ?)",
+                (mid, old["rating"], float(overall_rating), now, "reflection"),
+            )
+        conn.execute(
+            "INSERT INTO ratings(movie_id, rating, rated_at, source, updated_at) VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(movie_id) DO UPDATE SET"
+            "   rating=excluded.rating, source=excluded.source, updated_at=excluded.updated_at",
+            (mid, float(overall_rating), now, "reflection", now),
+        )
+
+
+def load_latest_reflection(movie_id_value: str, db_path: str | Path = DB_PATH) -> Dict[str, Any]:
+    """Latest rating+note per category (and overall) previously saved for this film."""
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT r.category, r.rating, r.note, r.created_at
+            FROM reflections r
+            INNER JOIN (
+                SELECT category, MAX(id) AS latest_id
+                FROM reflections WHERE movie_id=? GROUP BY category
+            ) latest ON latest.category = r.category AND latest.latest_id = r.id
+            WHERE r.movie_id=?
+            """,
+            (movie_id_value, movie_id_value),
+        ).fetchall()
+    categories: Dict[str, Dict[str, Any]] = {}
+    overall: Optional[Dict[str, Any]] = None
+    for row in rows:
+        entry = {"rating": row["rating"], "note": row["note"], "created_at": row["created_at"]}
+        if row["category"] == "Overall":
+            overall = entry
+        else:
+            categories[row["category"]] = entry
+    return {"categories": categories, "overall": overall}

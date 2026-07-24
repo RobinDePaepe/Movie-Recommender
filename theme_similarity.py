@@ -148,7 +148,10 @@ def _scale_net(values: np.ndarray) -> np.ndarray:
         return values
     pos = values[values > 0]
     if values.size < SMALL_SET or pos.size == 0:
-        ref = values.max()
+        # No positive values to anchor on (e.g. a negative-penalty-heavy taste profile) —
+        # scale by magnitude instead of collapsing the whole channel to zero, so the
+        # least-dissimilar candidates still outrank the most-dissimilar ones.
+        ref = float(np.abs(values).max())
     else:
         ref = float(np.percentile(pos, SIM_PERCENTILE))
     if ref <= 0:
@@ -276,6 +279,32 @@ def theme_taste_scores(candidates: pd.DataFrame, ratings: pd.DataFrame, likes: p
 
     out.iloc[:] = _scale_net(weighted_pos - neg_penalty)
     return out
+
+
+def most_similar_by_theme(movie_id: str, meta: pd.DataFrame, candidate_ids: List[str] | None = None, k: int = 5) -> List[Tuple[str, float]]:
+    """Top-k films most theme-similar to `movie_id`, restricted to `candidate_ids` if given.
+
+    Unlike ``theme_anchor_scores``/``theme_taste_scores`` (which score a candidate set against
+    one anchor or your whole taste profile), this returns nearest-neighbour (movie_id, score)
+    pairs for one query film — the "what have I rated that's thematically like this" lookup.
+    """
+    text_by_id = _text_by_id(meta)
+    query_text = text_by_id.get(str(movie_id), "")
+    if not query_text:
+        return []
+    pool = candidate_ids if candidate_ids is not None else meta["movie_id"].astype(str).tolist()
+    cand_ids = [str(mid) for mid in pool if str(mid) != str(movie_id)]
+    valid = [(mid, text_by_id.get(mid, "")) for mid in cand_ids]
+    valid = [(mid, t) for mid, t in valid if t]
+    if not valid:
+        return []
+    cand_ids = [mid for mid, _ in valid]
+    cand_texts = [t for _, t in valid]
+
+    vecs = embed_texts({str(movie_id): query_text, **dict(zip(cand_ids, cand_texts))})
+    sims = _sim_matrix(cand_ids, cand_texts, [str(movie_id)], [query_text], vecs)[:, 0]
+    order = np.argsort(sims)[::-1][:k]
+    return [(cand_ids[i], float(sims[i])) for i in order]
 
 
 def shared_theme_keywords(row_a: pd.Series, row_b: pd.Series, limit: int = 4) -> List[str]:

@@ -31,11 +31,11 @@ python sync_letterboxd.py $LETTERBOXD_USERNAME --status
 
 ## Environment
 
-The app reads `TMDB_API_KEY` and `LETTERBOXD_USERNAME` from the environment or a `.env` file. The Letterboxd export zip must be at `data/letterboxd_export.zip`.
+The app reads `TMDB_API_KEY` and `LETTERBOXD_USERNAME` (or `LETTERBOXD_RSS_CLIENT_ID`, a direct RSS feed URL, as an alternative) from the environment or a `.env` file. The Letterboxd export zip must be at `data/letterboxd_export.zip`.
 
 ## Architecture
 
-The app is a single-page Streamlit UI (`app.py`) that delegates all logic to these modules. `app.py` injects a custom dark-cinema theme (`inject_theme()`, `render_hero()`, `score_badge_html()`, `chips_html()`) and runs a **startup auto-sync**: once per session, if `LETTERBOXD_USERNAME` is set and the last sync was over an hour ago, it pulls RSS, applies overlays to SQLite, and persists the username to `.env`. Streamlit theme defaults live in `.streamlit/config.toml`.
+The app is a single-page Streamlit UI (`app.py`) that delegates all logic to these modules. `app.py` injects a custom dark-cinema theme (`inject_theme()`, `render_hero()`, `score_badge_html()`, `chips_html()`) and runs a **startup auto-sync**: once per session, if `LETTERBOXD_USERNAME` or `LETTERBOXD_RSS_CLIENT_ID` is set and the last sync was over an hour ago, it pulls RSS, applies overlays to SQLite, and persists the username to `.env`. Streamlit theme defaults live in `.streamlit/config.toml`.
 
 **`recommender.py`** — the core engine. The scoring pipeline is:
 1. `candidate_pool()` — picks watchlist or outside-watchlist candidates
