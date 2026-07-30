@@ -177,6 +177,7 @@ def flatten_tmdb_details(details: Dict[str, Any]) -> Dict[str, Any]:
         "name": details.get("title") or details.get("name") or "",
         "year": _release_year(details),
         "tmdb_id": details.get("id"),
+        "imdb_id": details.get("imdb_id"),
         "tmdb_title": details.get("title"),
         "tmdb_release_date": details.get("release_date"),
         "overview": details.get("overview") or "",

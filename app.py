@@ -1,5 +1,6 @@
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Dict, Optional
 import logging
 import math
 import os
@@ -25,6 +26,15 @@ try:
 except ImportError:
     _DOTENV_AVAILABLE = False
 
+from analysis import (
+    entity_affinity_table,
+    feedback_summary,
+    list_affinity,
+    mainstream_lean,
+    ratings_over_time,
+    reflection_category_correlation,
+    RATING_SOURCES,
+)
 from curator import CURATION_STYLES, anchor_options, build_curated_list
 from rate_review import render_reflection_panel
 from recommender import (
@@ -43,6 +53,8 @@ from recommender import (
     save_feedback,
 )
 from tmdb_client import TMDbClient, discover_movies_from_favorites, enrich_movies, metadata_from_cache
+from omdb_client import OMDbClient, enrich_imdb_ratings
+from letterboxd_ratings import LetterboxdRatingClient, enrich_letterboxd_ratings
 from letterboxd_sync import apply_sync_overlays, sync_rss, sync_status
 from movie_database import (
     DB_PATH,
@@ -56,10 +68,14 @@ from movie_database import (
     load_data_from_db,
     load_feedback_from_db,
     load_metadata_from_db,
+    load_rating_history_from_db,
+    load_reflections_from_db,
     rebuild_database,
     save_curated_week,
     remove_feedback_from_db,
     save_feedback_to_db,
+    update_omdb_ratings,
+    update_letterboxd_ratings,
 )
 
 st.set_page_config(page_title="Personal Movie Recommender", layout="wide", page_icon="🎬")
@@ -325,6 +341,25 @@ def render_grid(df: pd.DataFrame, height: int = 420) -> None:
     )
 
 
+PLOTLY_COLORWAY = ["#C9A227", "#4CAF50", "#EF5350", "#7A9CC6", "#9A9AA2", "#E6CF7A"]
+
+
+def style_fig(fig, height: Optional[int] = None):
+    """Apply the app's dark-cinema styling to a Plotly figure."""
+    fig.update_layout(
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, sans-serif", color="#CFCFD6"),
+        colorway=PLOTLY_COLORWAY,
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.07)", zerolinecolor="rgba(255,255,255,0.12)")
+    fig.update_yaxes(gridcolor="rgba(255,255,255,0.07)", zerolinecolor="rgba(255,255,255,0.12)")
+    if height:
+        fig.update_layout(height=height)
+    return fig
+
+
 export_zip = Path("data/letterboxd_export.zip")
 if not export_zip.exists():
     st.error("Put your Letterboxd export zip at data/letterboxd_export.zip")
@@ -388,6 +423,11 @@ if _auto_new_events > 0:
 def get_tmdb_api_key() -> str:
     """TMDb key entered on the Data & Sync page, falling back to the environment."""
     return st.session_state.get("tmdb_api_key_input") or os.getenv("TMDB_API_KEY", "")
+
+
+def get_omdb_api_key() -> str:
+    """OMDb key entered on the Data & Sync page, falling back to the environment."""
+    return st.session_state.get("omdb_api_key_input") or os.getenv("OMDB_API_KEY", "")
 
 
 cache_path = Path("data/tmdb_cache.json")
@@ -698,13 +738,11 @@ def render_score_breakdown(row: pd.Series, score_weights: dict, anchor_active: b
         color="Direction",
         color_discrete_map={"Positive": "#4CAF50", "Negative": "#EF5350"},
     )
+    style_fig(fig, height=max(200, len(components) * 38 + 80))
     fig.update_layout(
-        height=max(200, len(components) * 38 + 80),
         margin=dict(l=0, r=20, t=10, b=20),
         xaxis_title="Contribution to score",
         showlegend=False,
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -712,6 +750,346 @@ def render_score_breakdown(row: pd.Series, score_weights: dict, anchor_active: b
     lines = [f"- **{label}** ({val:+.2f}): {explanations[label]}" for label, val in components if label in explanations]
     if lines:
         st.markdown("\n".join(lines))
+
+
+def _analysis_overview_tab(ratings_df: pd.DataFrame, diary_df: pd.DataFrame, watched_df: pd.DataFrame) -> None:
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Watched movies", len(watched_df))
+    a2.metric("Rated movies", len(ratings_df))
+    a3.metric("Diary / watch events", len(diary_df))
+    if not diary_df.empty and "Rewatch" in diary_df.columns:
+        a4.metric("Rewatch events", int(pd.to_numeric(diary_df["Rewatch"], errors="coerce").fillna(0).sum()))
+    else:
+        a4.metric("Rewatch events", 0)
+
+    if ratings_df.empty:
+        st.info("No ratings yet.")
+        return
+
+    ratings_df = ratings_df.copy()
+    ratings_df["Rating"] = pd.to_numeric(ratings_df["Rating"], errors="coerce")
+    ratings_df["decade"] = ratings_df["Year"].apply(lambda y: f"{int(y)//10*10}s" if pd.notna(y) else "Unknown")
+
+    st.subheader("Rating distribution")
+    rated = ratings_df.dropna(subset=["Rating"])
+    if rated.empty:
+        st.info("No ratings yet.")
+    else:
+        fig = px.histogram(rated, x="Rating", nbins=10)
+        style_fig(fig)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Average rating by decade")
+    dec = ratings_df.groupby("decade", as_index=False).agg(avg_rating=("Rating", "mean"), count=("Rating", "count"))
+    if dec.empty:
+        st.info("No ratings yet.")
+    else:
+        fig = px.bar(dec.sort_values("decade"), x="decade", y="avg_rating", hover_data=["count"])
+        style_fig(fig)
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def _analysis_taste_over_time_tab(ratings_df: pd.DataFrame, diary_df: pd.DataFrame, db_path) -> None:
+    trend = ratings_over_time(ratings_df, diary_df)
+    if trend.empty:
+        st.info("Not enough dated ratings/diary entries yet to show a trend.")
+        return
+    if trend["period"].nunique() < 3:
+        st.caption("Only a few years of history so far — the trend will get more meaningful over time.")
+
+    st.subheader("Average rating by year")
+    fig = px.line(trend, x="period", y="avg_rating", markers=True)
+    style_fig(fig)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Diary activity & rewatches by year")
+    activity = trend.melt(
+        id_vars="period", value_vars=["n_diary_entries", "n_rewatches"],
+        var_name="type", value_name="count",
+    )
+    activity["type"] = activity["type"].map({"n_diary_entries": "Diary entries", "n_rewatches": "Rewatches"})
+    fig = px.bar(activity, x="period", y="count", color="type", barmode="group")
+    style_fig(fig)
+    st.plotly_chart(fig, use_container_width=True)
+
+    try:
+        history = load_rating_history_from_db(db_path=db_path)
+    except Exception:
+        history = pd.DataFrame()
+    if not history.empty:
+        st.caption(f"{len(history)} rating(s) revised since import.")
+
+
+def _analysis_entity_affinity_tab(ratings_df: pd.DataFrame, metadata: pd.DataFrame) -> None:
+    if ratings_df.empty or metadata.empty:
+        st.info("Rate more films with director/cast metadata to see affinity.")
+        return
+    min_count = st.slider("Minimum films rated", 2, 10, 3, key="entity_affinity_min_count")
+    table = entity_affinity_table(ratings_df, metadata, min_count=min_count)
+    if table.empty:
+        st.info("Not enough repeat directors/writers/cast yet — try lowering the minimum above.")
+        return
+    st.subheader("People I love (and don't)")
+    render_grid(table)
+
+    top15 = table.head(15).sort_values("affinity")
+    fig = px.bar(top15, x="affinity", y="entity", orientation="h", color="role")
+    style_fig(fig, height=max(300, len(top15) * 32 + 80))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _analysis_feedback_reflections_tab(feedback: pd.DataFrame, db_path) -> None:
+    st.subheader("Taste feedback distribution")
+    fb_summary = feedback_summary(feedback)
+    if fb_summary.empty:
+        st.info("No taste-feedback tags yet — see the 'Tune watched movies' tab to start tagging.")
+    else:
+        fig = px.bar(
+            fb_summary, x="description", y="count", color="polarity",
+            color_discrete_map={"positive": "#4CAF50", "neutral": "#9A9AA2", "negative": "#EF5350"},
+        )
+        fig.update_layout(xaxis_title="", xaxis_tickangle=-30)
+        style_fig(fig)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Which category best predicts your Overall rating?")
+    try:
+        reflections = load_reflections_from_db(db_path=db_path)
+    except Exception:
+        reflections = pd.DataFrame()
+    if reflections.empty:
+        st.info("No reflections saved yet — use the Reflection page to rate films by category.")
+        return
+    corr = reflection_category_correlation(reflections)
+    if corr.empty:
+        st.info("No reflections saved yet — use the Reflection page to rate films by category.")
+        return
+    enough = corr[corr["has_enough_data"]]
+    if enough.empty:
+        st.caption("Not enough reflections yet for a reliable correlation — keep rating films by category.")
+    fig = px.bar(corr.sort_values("corr_with_overall"), x="corr_with_overall", y="category", orientation="h")
+    style_fig(fig)
+    st.plotly_chart(fig, use_container_width=True)
+    render_grid(corr)
+
+
+def _analysis_mainstream_tab(ratings_df: pd.DataFrame, metadata: pd.DataFrame, lists_df: pd.DataFrame) -> None:
+    st.subheader("Genre taste profile")
+    if not metadata.empty and not ratings_df.empty:
+        merged = ratings_df.merge(prepare_metadata(metadata).drop(columns=["Name", "Year"], errors="ignore"), on="movie_id", how="inner")
+        if not merged.empty and "genres" in merged.columns:
+            rows = []
+            for _, row in merged.iterrows():
+                for g in row.get("genres", []) if isinstance(row.get("genres", []), list) else []:
+                    rows.append({"genre": g, "Rating": row["Rating"]})
+            genre_df = pd.DataFrame(rows)
+            if not genre_df.empty:
+                gstats = genre_df.groupby("genre", as_index=False).agg(avg_rating=("Rating", "mean"), count=("Rating", "count"))
+                gstats = gstats[gstats["count"] >= 3].sort_values(["avg_rating", "count"], ascending=False)
+                render_grid(gstats)
+                fig = px.bar(gstats.sort_values("avg_rating"), x="avg_rating", y="genre", orientation="h")
+                style_fig(fig, height=max(300, len(gstats) * 28 + 80))
+                st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("You vs. the crowd")
+    comparison, excluded = mainstream_lean(ratings_df, metadata)
+    available_sources = [s for s in RATING_SOURCES if f"{s}_rating_10" in comparison.columns]
+    if comparison.empty or not available_sources:
+        st.info("No TMDb/IMDb/Letterboxd rating data available yet for your rated films — fetch some in Data & Sync → External ratings.")
+    else:
+        source = st.radio("Compare against", available_sources, horizontal=True, key="mainstream_source")
+        rating_col = f"{source}_rating_10"
+        delta_col = f"{source}_delta"
+        sub = comparison.dropna(subset=[rating_col])
+        if sub.empty:
+            st.info(f"No {source} rating data available yet for your rated films.")
+        else:
+            avg_delta = sub[delta_col].mean()
+            lean = "more generous than" if avg_delta > 0 else "more critical than"
+            st.metric(f"Your average vs. {source} (0-10 scale)", f"{avg_delta:+.2f}", help=f"You rate {lean} the {source} crowd, on average.")
+            if excluded.get(source):
+                st.caption(f"{excluded[source]} rated film(s) excluded — no {source} rating available.")
+            fig = px.scatter(sub, x=rating_col, y="your_rating_10", hover_name="Name")
+            fig.add_shape(type="line", x0=0, x1=10, y0=0, y1=10, line=dict(dash="dash", color="#9A9AA2"))
+            fig.update_xaxes(range=[0, 10], title=f"{source} rating (0-10 scale)")
+            fig.update_yaxes(range=[0, 10], title="Your rating (0-10 scale)", scaleanchor="x", scaleratio=1)
+            style_fig(fig)
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Curated list affinity")
+    if lists_df.empty:
+        st.info("No curated lists imported yet.")
+    else:
+        la = list_affinity(lists_df, ratings_df)
+        if la.empty:
+            st.info("No curated lists imported yet.")
+        else:
+            render_grid(la)
+
+
+def _analysis_tune_watched_tab(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame, feedback: pd.DataFrame) -> None:
+    st.write("Tag watched films with taste labels to steer recommendations. Deliberate tuning here counts more than passive ratings or recommendation feedback.")
+
+    # Rated first so movies that are both watched and rated keep their Rating after dedup.
+    rated_movies = data["ratings"].copy()
+    watched_movies = data["watched"].copy()
+    all_watched = pd.concat([rated_movies, watched_movies], ignore_index=True).drop_duplicates("movie_id")
+
+    if all_watched.empty:
+        st.info("No watched movies found.")
+        return
+
+    tuned_movies = all_watched.copy()
+    if "Rating" not in tuned_movies.columns:
+        tuned_movies["Rating"] = pd.NA
+    if not metadata.empty:
+        meta_prepared = prepare_metadata(metadata)
+        tuned_movies = tuned_movies.merge(
+            meta_prepared[["movie_id", "overview", "genres", "directors", "poster_url"]],
+            on="movie_id",
+            how="left",
+        )
+    # Attach current feedback labels (only watched_tuning + generic taste labels shown here).
+    if not feedback.empty:
+        feedback_agg = feedback.groupby("movie_id")["feedback"].agg(list).reset_index()
+        tuned_movies = tuned_movies.merge(feedback_agg, on="movie_id", how="left")
+    if "feedback" not in tuned_movies.columns:
+        tuned_movies["feedback"] = pd.NA
+
+    def _labels(val):
+        if isinstance(val, list):
+            return [f for f in val if f in FEEDBACK_LABELS]
+        if pd.notna(val) and val in FEEDBACK_LABELS:
+            return [val]
+        return []
+
+    tuned_movies["_labels"] = tuned_movies["feedback"].apply(_labels)
+    tuned_movies["_tagged"] = tuned_movies["_labels"].apply(bool)
+
+    total_count = len(tuned_movies)
+    tagged_count = int(tuned_movies["_tagged"].sum())
+    st.caption(f"Tagged {tagged_count} of {total_count} watched films.")
+
+    # Filters
+    fcol1, fcol2, fcol3 = st.columns([2, 1, 2])
+    search_term = fcol1.text_input("Search movies", key="tune_search")
+    only_untagged = fcol2.checkbox("Only untagged", key="tune_untagged")
+    rating_range = fcol3.slider(
+        "Rating range", 0.5, 5.0, (0.5, 5.0), 0.5, key="tune_rating_range",
+        help="Filter by your star rating. Narrow either end to hide films outside the range; unrated films show only at the full range.",
+    )
+
+    view = tuned_movies
+    if search_term:
+        mask = (
+            view["Name"].str.lower().str.contains(search_term.lower(), na=False)
+            | view["Year"].astype(str).str.contains(search_term, na=False)
+        )
+        view = view[mask]
+    if only_untagged:
+        view = view[~view["_tagged"]]
+    lo, hi = rating_range
+    if (lo, hi) != (0.5, 5.0):
+        view = view[pd.to_numeric(view["Rating"], errors="coerce").between(lo, hi)]
+
+    # Highest-signal first: untagged before tagged, then by rating desc.
+    view = view.assign(_rating_sort=pd.to_numeric(view["Rating"], errors="coerce").fillna(-1))
+    view = view.sort_values(["_tagged", "_rating_sort"], ascending=[True, False])
+
+    # Pagination
+    PAGE_SIZE = 25
+    n_pages = max(1, math.ceil(len(view) / PAGE_SIZE))
+    page_num = min(st.session_state.get("tune_page", 0), n_pages - 1)
+    pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
+    if pcol1.button("◀ Prev", disabled=page_num <= 0, key="tune_prev"):
+        st.session_state["tune_page"] = page_num - 1
+        st.rerun()
+    pcol2.markdown(f"<div style='text-align:center'>Page {page_num + 1} of {n_pages} — {len(view)} films</div>", unsafe_allow_html=True)
+    if pcol3.button("Next ▶", disabled=page_num >= n_pages - 1, key="tune_next"):
+        st.session_state["tune_page"] = page_num + 1
+        st.rerun()
+
+    page_rows = view.iloc[page_num * PAGE_SIZE:(page_num + 1) * PAGE_SIZE]
+
+    # Render page; widget values are read back at save time from session_state.
+    page_state = []  # (movie_id, current_labels, widget_key)
+    for _, row in page_rows.iterrows():
+        mid = row["movie_id"]
+        current_feedback = row["_labels"]
+        widget_key = f"tunefb_{mid}"
+        with st.container():
+            col1, col2, col3 = st.columns([1, 3, 2])
+            with col1:
+                _poster = row.get("poster_url")
+                if pd.notna(_poster) and str(_poster).strip():
+                    st.image(str(_poster).strip(), width=80)
+                else:
+                    st.write("📽️")
+            with col2:
+                st.write(f"**{row['Name']} ({fmt_year(row.get('Year'))})**")
+                if pd.notna(row.get("overview")):
+                    st.caption(row["overview"][:200] + "..." if len(str(row["overview"])) > 200 else str(row["overview"]))
+                genres = row.get("genres", [])
+                if isinstance(genres, list) and genres:
+                    st.caption("Genres: " + ", ".join(genres[:3]))
+                rating = row.get("Rating")
+                if pd.notna(rating):
+                    st.caption(f"Your rating: {rating}/5")
+            with col3:
+                st.multiselect(
+                    "Taste feedback",
+                    options=list(FEEDBACK_LABELS.keys()),
+                    default=current_feedback,
+                    format_func=lambda x: FEEDBACK_LABELS[x]["description"],
+                    key=widget_key,
+                )
+        page_state.append((mid, current_feedback, widget_key))
+
+    if page_rows.empty:
+        st.info("No films match these filters.")
+    elif st.button("Save changes on this page", type="primary", key="tune_save_page"):
+        changed = 0
+        for mid, current_feedback, widget_key in page_state:
+            selected = st.session_state.get(widget_key, current_feedback)
+            new_labels = [l for l in selected if l not in current_feedback]
+            removed_labels = [l for l in current_feedback if l not in selected]
+            for label in new_labels:
+                store_feedback(mid, label, scope="watched_tuning")
+            if removed_labels:
+                remove_feedback(mid, removed_labels)
+            if new_labels or removed_labels:
+                changed += 1
+        st.success(f"Saved changes for {changed} film(s).")
+        st.rerun()
+
+
+def render_analysis_page(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame, feedback: pd.DataFrame) -> None:
+    st.subheader("Personal movie analysis")
+    ratings_df = data["ratings"].copy()
+    diary_df = data["diary"].copy()
+    watched_df = data["watched"].copy()
+    lists_df = data.get("lists", pd.DataFrame()).copy()
+
+    if ratings_df.empty and watched_df.empty:
+        st.info("No watched/rating data loaded yet.")
+        return
+
+    tabs = st.tabs([
+        "Overview", "Taste over time", "People I love", "Feedback & reflections",
+        "Mainstream vs. me", "Tune watched movies",
+    ])
+    with tabs[0]:
+        _analysis_overview_tab(ratings_df, diary_df, watched_df)
+    with tabs[1]:
+        _analysis_taste_over_time_tab(ratings_df, diary_df, DB_PATH)
+    with tabs[2]:
+        _analysis_entity_affinity_tab(ratings_df, metadata)
+    with tabs[3]:
+        _analysis_feedback_reflections_tab(feedback, DB_PATH)
+    with tabs[4]:
+        _analysis_mainstream_tab(ratings_df, metadata, lists_df)
+    with tabs[5]:
+        _analysis_tune_watched_tab(data, metadata, feedback)
 
 
 if page == "Tonight's Pick":
@@ -961,182 +1339,7 @@ elif page == "Recommendations":
         )
 
 elif page == "Analysis":
-    st.subheader("Personal movie analysis")
-    ratings_df = data["ratings"].copy()
-    diary_df = data["diary"].copy()
-    watched_df = data["watched"].copy()
-    if ratings_df.empty and watched_df.empty:
-        st.info("No watched/rating data loaded yet.")
-    else:
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("Watched movies", len(watched_df))
-        a2.metric("Rated movies", len(ratings_df))
-        a3.metric("Diary / watch events", len(diary_df))
-        if not diary_df.empty and "Rewatch" in diary_df.columns:
-            a4.metric("Rewatch events", int(pd.to_numeric(diary_df["Rewatch"], errors="coerce").fillna(0).sum()))
-        else:
-            a4.metric("Rewatch events", 0)
-
-        if not ratings_df.empty:
-            ratings_df["Rating"] = pd.to_numeric(ratings_df["Rating"], errors="coerce")
-            ratings_df["decade"] = ratings_df["Year"].apply(lambda y: f"{int(y)//10*10}s" if pd.notna(y) else "Unknown")
-            st.subheader("Rating distribution")
-            fig = px.histogram(ratings_df.dropna(subset=["Rating"]), x="Rating", nbins=10)
-            st.plotly_chart(fig, use_container_width=True)
-            st.subheader("Average rating by decade")
-            dec = ratings_df.groupby("decade", as_index=False).agg(avg_rating=("Rating", "mean"), count=("Rating", "count"))
-            fig = px.bar(dec.sort_values("decade"), x="decade", y="avg_rating", hover_data=["count"])
-            st.plotly_chart(fig, use_container_width=True)
-
-        meta_for_analysis = metadata.copy()
-        if not meta_for_analysis.empty and not ratings_df.empty:
-            merged = ratings_df.merge(prepare_metadata(meta_for_analysis).drop(columns=["Name", "Year"], errors="ignore"), on="movie_id", how="inner")
-            if not merged.empty and "genres" in merged.columns:
-                rows = []
-                for _, row in merged.iterrows():
-                    for g in row.get("genres", []) if isinstance(row.get("genres", []), list) else []:
-                        rows.append({"genre": g, "Rating": row["Rating"]})
-                genre_df = pd.DataFrame(rows)
-                if not genre_df.empty:
-                    st.subheader("Genre taste profile")
-                    gstats = genre_df.groupby("genre", as_index=False).agg(avg_rating=("Rating", "mean"), count=("Rating", "count"))
-                    gstats = gstats[gstats["count"] >= 3].sort_values(["avg_rating", "count"], ascending=False)
-                    st.dataframe(gstats, use_container_width=True, hide_index=True)
-
-        # Tune watched movies section
-        st.subheader("Tune watched movies")
-        st.write("Tag watched films with taste labels to steer recommendations. Deliberate tuning here counts more than passive ratings or recommendation feedback.")
-
-        # Rated first so movies that are both watched and rated keep their Rating after dedup.
-        rated_movies = data["ratings"].copy()
-        watched_movies = data["watched"].copy()
-        all_watched = pd.concat([rated_movies, watched_movies], ignore_index=True).drop_duplicates("movie_id")
-
-        if all_watched.empty:
-            st.info("No watched movies found.")
-        else:
-            tuned_movies = all_watched.copy()
-            if "Rating" not in tuned_movies.columns:
-                tuned_movies["Rating"] = pd.NA
-            if not metadata.empty:
-                meta_prepared = prepare_metadata(metadata)
-                tuned_movies = tuned_movies.merge(
-                    meta_prepared[["movie_id", "overview", "genres", "directors", "poster_url"]],
-                    on="movie_id",
-                    how="left",
-                )
-            # Attach current feedback labels (only watched_tuning + generic taste labels shown here).
-            if not feedback.empty:
-                feedback_agg = feedback.groupby("movie_id")["feedback"].agg(list).reset_index()
-                tuned_movies = tuned_movies.merge(feedback_agg, on="movie_id", how="left")
-            if "feedback" not in tuned_movies.columns:
-                tuned_movies["feedback"] = pd.NA
-
-            def _labels(val):
-                if isinstance(val, list):
-                    return [f for f in val if f in FEEDBACK_LABELS]
-                if pd.notna(val) and val in FEEDBACK_LABELS:
-                    return [val]
-                return []
-
-            tuned_movies["_labels"] = tuned_movies["feedback"].apply(_labels)
-            tuned_movies["_tagged"] = tuned_movies["_labels"].apply(bool)
-
-            total_count = len(tuned_movies)
-            tagged_count = int(tuned_movies["_tagged"].sum())
-            st.caption(f"Tagged {tagged_count} of {total_count} watched films.")
-
-            # Filters
-            fcol1, fcol2, fcol3 = st.columns([2, 1, 2])
-            search_term = fcol1.text_input("Search movies", key="tune_search")
-            only_untagged = fcol2.checkbox("Only untagged", key="tune_untagged")
-            rating_range = fcol3.slider(
-                "Rating range", 0.5, 5.0, (0.5, 5.0), 0.5, key="tune_rating_range",
-                help="Filter by your star rating. Narrow either end to hide films outside the range; unrated films show only at the full range.",
-            )
-
-            view = tuned_movies
-            if search_term:
-                mask = (
-                    view["Name"].str.lower().str.contains(search_term.lower(), na=False)
-                    | view["Year"].astype(str).str.contains(search_term, na=False)
-                )
-                view = view[mask]
-            if only_untagged:
-                view = view[~view["_tagged"]]
-            lo, hi = rating_range
-            if (lo, hi) != (0.5, 5.0):
-                view = view[pd.to_numeric(view["Rating"], errors="coerce").between(lo, hi)]
-
-            # Highest-signal first: untagged before tagged, then by rating desc.
-            view = view.assign(_rating_sort=pd.to_numeric(view["Rating"], errors="coerce").fillna(-1))
-            view = view.sort_values(["_tagged", "_rating_sort"], ascending=[True, False])
-
-            # Pagination
-            PAGE_SIZE = 25
-            n_pages = max(1, math.ceil(len(view) / PAGE_SIZE))
-            page_num = min(st.session_state.get("tune_page", 0), n_pages - 1)
-            pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
-            if pcol1.button("◀ Prev", disabled=page_num <= 0, key="tune_prev"):
-                st.session_state["tune_page"] = page_num - 1
-                st.rerun()
-            pcol2.markdown(f"<div style='text-align:center'>Page {page_num + 1} of {n_pages} — {len(view)} films</div>", unsafe_allow_html=True)
-            if pcol3.button("Next ▶", disabled=page_num >= n_pages - 1, key="tune_next"):
-                st.session_state["tune_page"] = page_num + 1
-                st.rerun()
-
-            page_rows = view.iloc[page_num * PAGE_SIZE:(page_num + 1) * PAGE_SIZE]
-
-            # Render page; widget values are read back at save time from session_state.
-            page_state = []  # (movie_id, current_labels, widget_key)
-            for _, row in page_rows.iterrows():
-                mid = row["movie_id"]
-                current_feedback = row["_labels"]
-                widget_key = f"tunefb_{mid}"
-                with st.container():
-                    col1, col2, col3 = st.columns([1, 3, 2])
-                    with col1:
-                        _poster = row.get("poster_url")
-                        if pd.notna(_poster) and str(_poster).strip():
-                            st.image(str(_poster).strip(), width=80)
-                        else:
-                            st.write("📽️")
-                    with col2:
-                        st.write(f"**{row['Name']} ({fmt_year(row.get('Year'))})**")
-                        if pd.notna(row.get("overview")):
-                            st.caption(row["overview"][:200] + "..." if len(str(row["overview"])) > 200 else str(row["overview"]))
-                        genres = row.get("genres", [])
-                        if isinstance(genres, list) and genres:
-                            st.caption("Genres: " + ", ".join(genres[:3]))
-                        rating = row.get("Rating")
-                        if pd.notna(rating):
-                            st.caption(f"Your rating: {rating}/5")
-                    with col3:
-                        st.multiselect(
-                            "Taste feedback",
-                            options=list(FEEDBACK_LABELS.keys()),
-                            default=current_feedback,
-                            format_func=lambda x: FEEDBACK_LABELS[x]["description"],
-                            key=widget_key,
-                        )
-                page_state.append((mid, current_feedback, widget_key))
-
-            if page_rows.empty:
-                st.info("No films match these filters.")
-            elif st.button("Save changes on this page", type="primary", key="tune_save_page"):
-                changed = 0
-                for mid, current_feedback, widget_key in page_state:
-                    selected = st.session_state.get(widget_key, current_feedback)
-                    new_labels = [l for l in selected if l not in current_feedback]
-                    removed_labels = [l for l in current_feedback if l not in selected]
-                    for label in new_labels:
-                        store_feedback(mid, label, scope="watched_tuning")
-                    if removed_labels:
-                        remove_feedback(mid, removed_labels)
-                    if new_labels or removed_labels:
-                        changed += 1
-                st.success(f"Saved changes for {changed} film(s).")
-                st.rerun()
+    render_analysis_page(data, metadata, feedback)
 
 elif page == "Evaluation":
     st.subheader("Evaluation against historical ratings")
@@ -1328,7 +1531,7 @@ else:  # "Data & Sync"
     dm3.metric("TMDb matches", found_count)
     dm4.metric("Backend", "SQLite" if use_database else "CSV/JSON")
 
-    tab_tmdb, tab_sync, tab_db = st.tabs(["TMDb metadata", "Letterboxd sync", "SQLite database"])
+    tab_tmdb, tab_sync, tab_ratings, tab_db = st.tabs(["TMDb metadata", "Letterboxd sync", "External ratings", "SQLite database"])
 
     with tab_tmdb:
         st.text_input(
@@ -1480,3 +1683,62 @@ else:  # "Data & Sync"
                 st.success("Imported latest export.")
                 st.json(result)
                 st.rerun()
+
+    with tab_ratings:
+        st.write("Fetch IMDb and Letterboxd average ratings so the 'Mainstream vs. me' analysis tab can compare your taste against more than just TMDb.")
+        if not use_database:
+            st.caption("External ratings require the SQLite backend. Build the database first (SQLite database tab).")
+        else:
+            st.subheader("IMDb ratings (via OMDb)")
+            st.text_input(
+                "OMDb API key",
+                value=os.getenv("OMDB_API_KEY", ""),
+                type="password",
+                key="omdb_api_key_input",
+                help="Free key at omdbapi.com. TMDb doesn't expose the real IMDb score, so this is a separate lookup by IMDb ID (requires TMDb metadata already fetched).",
+            )
+            imdb_candidates = metadata.dropna(subset=["imdb_id"]) if "imdb_id" in metadata.columns else pd.DataFrame()
+            if not imdb_candidates.empty and "imdb_rating" in imdb_candidates.columns:
+                imdb_missing = imdb_candidates[imdb_candidates["imdb_rating"].isna()]
+            else:
+                imdb_missing = imdb_candidates
+            st.caption(f"{len(imdb_missing)} of {len(imdb_candidates)} TMDb-matched films still need an IMDb rating fetch.")
+            imdb_limit = st.number_input("Films to fetch this run", min_value=1, max_value=max(1, int(len(imdb_candidates)) or 1), value=min(50, max(1, int(len(imdb_missing)) or 1)), step=25, key="imdb_fetch_limit")
+            imdb_force = st.checkbox("Refresh already-fetched IMDb ratings", value=False, key="imdb_force")
+            if st.button("Fetch IMDb ratings"):
+                key = get_omdb_api_key()
+                if not key:
+                    st.error("Add an OMDb API key first.")
+                elif imdb_candidates.empty:
+                    st.warning("Fetch TMDb metadata first — IMDb lookups need each film's IMDb ID from TMDb.")
+                else:
+                    client = OMDbClient(api_key=key)
+                    with st.spinner("Fetching IMDb ratings..."):
+                        ratings_map = enrich_imdb_ratings(imdb_candidates, client=client, limit=int(imdb_limit), force=imdb_force)
+                        updated = update_omdb_ratings(ratings_map, db_path=db_path)
+                    st.success(f"Fetched {len(ratings_map)} IMDb ratings, updated {updated} film(s) in the database.")
+                    st.rerun()
+
+            st.divider()
+            st.subheader("Letterboxd average ratings")
+            st.caption("Unofficial — scrapes the average rating shown on each film's Letterboxd page (one request per film, rate-limited and cached).")
+            movies_with_uri = pd.concat(
+                [data["ratings"], data["watched"], data["watchlist"]], ignore_index=True
+            ).reindex(columns=["movie_id", "Letterboxd URI"]).dropna(subset=["Letterboxd URI"])
+            movies_with_uri = movies_with_uri[movies_with_uri["Letterboxd URI"].astype(str).str.strip() != ""].drop_duplicates("movie_id")
+            lb_meta_cols = metadata[["movie_id", "letterboxd_rating"]] if "letterboxd_rating" in metadata.columns else pd.DataFrame(columns=["movie_id", "letterboxd_rating"])
+            movies_with_uri = movies_with_uri.merge(lb_meta_cols, on="movie_id", how="left")
+            lb_missing = movies_with_uri[movies_with_uri["letterboxd_rating"].isna()]
+            st.caption(f"{len(lb_missing)} of {len(movies_with_uri)} films with a Letterboxd URI still need a rating fetch.")
+            lb_limit = st.number_input("Films to fetch this run", min_value=1, max_value=max(1, int(len(movies_with_uri)) or 1), value=min(30, max(1, int(len(lb_missing)) or 1)), step=10, key="lb_fetch_limit")
+            lb_force = st.checkbox("Refresh already-fetched Letterboxd ratings", value=False, key="lb_force")
+            if st.button("Fetch Letterboxd ratings"):
+                if movies_with_uri.empty:
+                    st.warning("No films with a known Letterboxd URI found.")
+                else:
+                    client = LetterboxdRatingClient()
+                    with st.spinner("Scraping Letterboxd ratings (this can take a while)..."):
+                        ratings_map = enrich_letterboxd_ratings(movies_with_uri, client=client, limit=int(lb_limit), force=lb_force)
+                        updated = update_letterboxd_ratings(ratings_map, db_path=db_path)
+                    st.success(f"Fetched {len(ratings_map)} Letterboxd ratings, updated {updated} film(s) in the database.")
+                    st.rerun()

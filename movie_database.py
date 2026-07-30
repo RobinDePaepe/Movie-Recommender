@@ -126,6 +126,10 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
                 tmdb_url TEXT,
                 discovered_from TEXT,
                 raw_json TEXT,
+                imdb_id TEXT,
+                imdb_rating REAL,
+                imdb_votes INTEGER,
+                letterboxd_rating REAL,
                 updated_at TEXT NOT NULL
             );
 
@@ -176,6 +180,14 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(feedback)").fetchall()}
         if "scope" not in cols:
             conn.execute("ALTER TABLE feedback ADD COLUMN scope TEXT")
+
+        # Migration: add IMDb/Letterboxd rating columns to databases created before external-rating tracking existed.
+        meta_cols = {row[1] for row in conn.execute("PRAGMA table_info(movie_metadata)").fetchall()}
+        for col, coltype in [
+            ("imdb_id", "TEXT"), ("imdb_rating", "REAL"), ("imdb_votes", "INTEGER"), ("letterboxd_rating", "REAL"),
+        ]:
+            if col not in meta_cols:
+                conn.execute(f"ALTER TABLE movie_metadata ADD COLUMN {col} {coltype}")
 
 
 def _safe_year(year: Any) -> Optional[int]:
@@ -435,6 +447,22 @@ def load_feedback_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:
         return pd.read_sql_query("SELECT movie_id, feedback, COALESCE(scope, 'recommendation') AS scope, created_at FROM feedback", conn)
 
 
+def load_rating_history_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        return pd.read_sql_query("SELECT movie_id, old_rating, new_rating, changed_at, source FROM rating_history", conn)
+
+
+def load_reflections_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        return pd.read_sql_query(
+            "SELECT r.movie_id, m.name AS Name, m.year AS Year, r.category, r.rating, r.note, r.created_at "
+            "FROM reflections r JOIN movies m USING(movie_id)",
+            conn,
+        )
+
+
 def database_status(db_path: str | Path = DB_PATH) -> Dict[str, Any]:
     if not Path(db_path).exists():
         return {"exists": False}
@@ -466,23 +494,52 @@ def _upsert_metadata(conn: sqlite3.Connection, mid: str, entry: Dict[str, Any]) 
     poster_url = entry.get("poster_url") or (f"https://image.tmdb.org/t/p/w342{poster_path}" if poster_path else "")
     conn.execute(
         """
-        INSERT INTO movie_metadata(movie_id, tmdb_id, tmdb_found, tmdb_title, tmdb_release_date, overview, genres, directors, writers, cast, keywords, countries, languages, moods, runtime, tmdb_vote_average, tmdb_vote_count, tmdb_popularity, poster_path, poster_url, tmdb_url, discovered_from, raw_json, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO movie_metadata(movie_id, tmdb_id, tmdb_found, tmdb_title, tmdb_release_date, overview, genres, directors, writers, cast, keywords, countries, languages, moods, runtime, tmdb_vote_average, tmdb_vote_count, tmdb_popularity, poster_path, poster_url, tmdb_url, discovered_from, raw_json, imdb_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(movie_id) DO UPDATE SET
           tmdb_id=excluded.tmdb_id, tmdb_found=excluded.tmdb_found, tmdb_title=excluded.tmdb_title, tmdb_release_date=excluded.tmdb_release_date,
           overview=excluded.overview, genres=excluded.genres, directors=excluded.directors, writers=excluded.writers, cast=excluded.cast,
           keywords=excluded.keywords, countries=excluded.countries, languages=excluded.languages, moods=excluded.moods, runtime=excluded.runtime,
           tmdb_vote_average=excluded.tmdb_vote_average, tmdb_vote_count=excluded.tmdb_vote_count, tmdb_popularity=excluded.tmdb_popularity,
           poster_path=excluded.poster_path, poster_url=excluded.poster_url, tmdb_url=excluded.tmdb_url, discovered_from=excluded.discovered_from,
-          raw_json=excluded.raw_json, updated_at=excluded.updated_at
+          raw_json=excluded.raw_json, imdb_id=excluded.imdb_id, updated_at=excluded.updated_at
         """,
         (
             mid, entry.get("tmdb_id"), int(bool(entry.get("tmdb_found"))), entry.get("tmdb_title"), entry.get("tmdb_release_date"), entry.get("overview", ""),
             _json(entry.get("genres")), _json(entry.get("directors")), _json(entry.get("writers")), _json(entry.get("cast")), _json(entry.get("keywords")),
             _json(entry.get("countries")), _json(entry.get("languages")), _json(entry.get("moods")), entry.get("runtime"), entry.get("tmdb_vote_average"),
-            entry.get("tmdb_vote_count"), entry.get("tmdb_popularity"), poster_path, poster_url, entry.get("tmdb_url"), entry.get("discovered_from"), json.dumps(entry, ensure_ascii=False), now,
+            entry.get("tmdb_vote_count"), entry.get("tmdb_popularity"), poster_path, poster_url, entry.get("tmdb_url"), entry.get("discovered_from"), json.dumps(entry, ensure_ascii=False),
+            entry.get("imdb_id"), now,
         ),
     )
+
+
+def update_omdb_ratings(ratings: Dict[str, Dict[str, Any]], db_path: str | Path = DB_PATH) -> int:
+    """Write IMDb rating/vote-count (keyed by movie_id) into existing movie_metadata rows."""
+    init_db(db_path)
+    updated = 0
+    with connect(db_path) as conn:
+        for mid, info in ratings.items():
+            cur = conn.execute(
+                "UPDATE movie_metadata SET imdb_rating=?, imdb_votes=?, updated_at=? WHERE movie_id=?",
+                (info.get("imdb_rating"), info.get("imdb_votes"), utc_now(), mid),
+            )
+            updated += cur.rowcount
+    return updated
+
+
+def update_letterboxd_ratings(ratings: Dict[str, float], db_path: str | Path = DB_PATH) -> int:
+    """Write Letterboxd average rating (keyed by movie_id) into existing movie_metadata rows."""
+    init_db(db_path)
+    updated = 0
+    with connect(db_path) as conn:
+        for mid, rating in ratings.items():
+            cur = conn.execute(
+                "UPDATE movie_metadata SET letterboxd_rating=?, updated_at=? WHERE movie_id=?",
+                (rating, utc_now(), mid),
+            )
+            updated += cur.rowcount
+    return updated
 
 
 def _start_run(conn: sqlite3.Connection, source: str) -> int:

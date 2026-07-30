@@ -90,11 +90,14 @@ def _read_csv(path: Path, **kwargs) -> pd.DataFrame:
 def ensure_export_dir(export_zip: str | Path = "data/letterboxd_export.zip", out_dir: str | Path = "data/letterboxd") -> Path:
     export_zip = Path(export_zip)
     out_dir = Path(out_dir)
-    if out_dir.exists() and (out_dir / "ratings.csv").exists():
+    marker = out_dir / ".source_zip_mtime"
+    zip_mtime = str(export_zip.stat().st_mtime)
+    if out_dir.exists() and (out_dir / "ratings.csv").exists() and marker.exists() and marker.read_text() == zip_mtime:
         return out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(export_zip, "r") as zf:
         zf.extractall(out_dir)
+    marker.write_text(zip_mtime)
     return out_dir
 
 
@@ -456,6 +459,60 @@ def add_content_similarity(candidates: pd.DataFrame, ratings: pd.DataFrame, like
     return cand, taste_profile
 
 
+DEFAULT_ENTITY_COL_WEIGHTS = {"directors": 1.5, "writers": 0.8, "cast": 0.4}
+DEFAULT_ENTITY_PRIOR_COUNT = 3
+
+
+def compute_entity_affinity(
+    ratings: pd.DataFrame,
+    metadata: pd.DataFrame | None,
+    col_weights: Dict[str, float] | None = None,
+    prior_count: int = DEFAULT_ENTITY_PRIOR_COUNT,
+) -> Dict[str, Dict[str, Any]]:
+    """Per-entity (director/writer/cast) Bayesian-shrunk rating affinity.
+
+    Returns {entity: {"affinity": normalised deviation from your mean rating,
+    "n_ratings": films counted, "avg_rating": raw mean, "columns": roles the
+    entity appeared under}}. Shrinking toward the global mean (via `prior_count`)
+    keeps a single lucky 5★ film from inflating an entity's score.
+    """
+    col_weights = col_weights or DEFAULT_ENTITY_COL_WEIGHTS
+    if ratings.empty or metadata is None:
+        return {}
+    meta = prepare_metadata(metadata)
+    if meta.empty:
+        return {}
+    rated = ratings.copy()
+    rated["Rating"] = pd.to_numeric(rated.get("Rating"), errors="coerce")
+    rated = rated.dropna(subset=["Rating"])
+    rated_meta = rated.merge(meta[["movie_id", "directors", "cast", "writers"]], on="movie_id", how="inner")
+    if rated_meta.empty:
+        return {}
+
+    global_mean = rated_meta["Rating"].mean()
+
+    entity_ratings: Dict[str, List[float]] = {}
+    entity_columns: Dict[str, set] = {}
+    for _, row in rated_meta.iterrows():
+        for col in col_weights:
+            for entity in _as_list(row.get(col, [])):
+                entity_ratings.setdefault(entity, []).append(float(row["Rating"]))
+                entity_columns.setdefault(entity, set()).add(col)
+
+    entity_affinity: Dict[str, Dict[str, Any]] = {}
+    for entity, rs in entity_ratings.items():
+        n = len(rs)
+        avg_rating = sum(rs) / n
+        bayes_avg = (sum(rs) + prior_count * global_mean) / (n + prior_count)
+        entity_affinity[entity] = {
+            "affinity": (bayes_avg - global_mean) / 2.0,  # normalised deviation
+            "n_ratings": n,
+            "avg_rating": avg_rating,
+            "columns": sorted(entity_columns[entity]),
+        }
+    return entity_affinity
+
+
 def add_entity_affinity(candidates: pd.DataFrame, ratings: pd.DataFrame, metadata: pd.DataFrame | None) -> pd.DataFrame:
     """Score candidates by your historical ratings for their directors, cast, and writers.
 
@@ -465,39 +522,15 @@ def add_entity_affinity(candidates: pd.DataFrame, ratings: pd.DataFrame, metadat
     import numpy as np
     out = candidates.copy()
     out["entity_score"] = 0.0
-    if ratings.empty or metadata is None:
+    col_weights = DEFAULT_ENTITY_COL_WEIGHTS
+    entity_affinity_full = compute_entity_affinity(ratings, metadata, col_weights)
+    if not entity_affinity_full:
         return out
-    meta = prepare_metadata(metadata)
-    if meta.empty:
-        return out
-    rated = ratings.copy()
-    rated["Rating"] = pd.to_numeric(rated.get("Rating"), errors="coerce")
-    rated = rated.dropna(subset=["Rating"])
-    rated_meta = rated.merge(meta[["movie_id", "directors", "cast", "writers"]], on="movie_id", how="inner")
-    if rated_meta.empty:
-        return out
-
-    global_mean = rated_meta["Rating"].mean()
-    PRIOR_COUNT = 3  # shrink small samples toward the mean
-    COL_WEIGHTS = {"directors": 1.5, "writers": 0.8, "cast": 0.4}
-
-    # Collect ratings per entity across all tracked columns
-    entity_ratings: Dict[str, List[float]] = {}
-    for _, row in rated_meta.iterrows():
-        for col in COL_WEIGHTS:
-            for entity in _as_list(row.get(col, [])):
-                entity_ratings.setdefault(entity, []).append(float(row["Rating"]))
-
-    # Bayesian average → deviation from global mean → weighted affinity score
-    entity_affinity: Dict[str, float] = {}
-    for entity, rs in entity_ratings.items():
-        n = len(rs)
-        bayes_avg = (sum(rs) + PRIOR_COUNT * global_mean) / (n + PRIOR_COUNT)
-        entity_affinity[entity] = (bayes_avg - global_mean) / 2.0  # normalised deviation
+    entity_affinity = {entity: info["affinity"] for entity, info in entity_affinity_full.items()}
 
     def calc_entity_score(row: pd.Series) -> float:
         score = 0.0
-        for col, col_w in COL_WEIGHTS.items():
+        for col, col_w in col_weights.items():
             entities = _as_list(row.get(col, []))
             if not entities:
                 continue
