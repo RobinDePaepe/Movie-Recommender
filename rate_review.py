@@ -13,7 +13,7 @@ import streamlit as st
 from streamlit_extras.star_rating import star_rating
 from streamlit_extras.stylable_container import stylable_container
 
-from movie_database import import_tmdb_cache, load_latest_reflection, save_reflection
+from movie_database import import_tmdb_cache, load_latest_reflection, save_reflection, save_watch_context
 from reflection import REFLECTION_CATEGORIES, build_facets, resolve_for_reflection, suggested_overall_rating
 
 
@@ -182,3 +182,26 @@ def render_reflection_panel(
             import_tmdb_cache(cache_path=cache_path, db_path=db_path)
         st.success(f"Saved reflection for {resolved['title']} — official rating set to {overall_rating:.1f}★.")
         st.rerun()
+
+    diary = data.get("diary", pd.DataFrame())
+    events = diary[diary.get("movie_id", pd.Series(dtype=str)) == mid].copy() if not diary.empty else pd.DataFrame()
+    if not events.empty and "watched_event_id" in events.columns:
+        events = events.dropna(subset=["watched_event_id"]).sort_values("Watched Date", ascending=False)
+    if not events.empty:
+        st.divider()
+        st.markdown("#### Context for this watch")
+        event_labels = [f"{r['Watched Date']} · event {int(r['watched_event_id'])}" for _, r in events.iterrows()]
+        with st.form(f"watch_context_{mid}"):
+            event_label = st.selectbox("Viewing", event_labels)
+            c1, c2, c3 = st.columns(3)
+            mood = c1.text_input("Mood", placeholder="tired, curious, celebratory")
+            companions = c2.text_input("Watched with", placeholder="solo, partner, friends")
+            setting = c3.text_input("Setting", placeholder="home, cinema, flight")
+            context_note = st.text_area("Short note", placeholder="What made this viewing distinct?")
+            rewatch_answer = st.selectbox("Would you rewatch?", ["Not sure", "Yes", "No"])
+            if st.form_submit_button("Save watch context"):
+                event_idx = event_labels.index(event_label)
+                event_id = int(events.iloc[event_idx]["watched_event_id"])
+                would_rewatch = None if rewatch_answer == "Not sure" else rewatch_answer == "Yes"
+                save_watch_context(event_id, mood, companions, setting, context_note, would_rewatch, db_path=db_path)
+                st.success("Watch context saved.")

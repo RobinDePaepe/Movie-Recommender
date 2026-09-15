@@ -94,7 +94,7 @@ def _title_year_from_title(title: str) -> Tuple[str, int | None]:
     match = re.match(r"^(.*?),\s*(\d{4})$", cleaned)
     if match:
         return match.group(1).strip(), int(match.group(2))
-    return "", None
+    return cleaned, None
 
 
 def _movie_id(name: str, year: Any) -> str:
@@ -109,6 +109,8 @@ def parse_rss_items(xml_text: str) -> pd.DataFrame:
         title = _text_any(item, ["title"])
         link = _text_any(item, ["link"])
         guid = _text_any(item, ["guid"])
+        if "/list/" in link or guid.lower().startswith("letterboxd-list-"):
+            continue
         pub_date = _parse_date(_text_any(item, ["pubDate"]))
         film_title = _text_any(item, [f"{{{LB_NS}}}filmTitle", "letterboxd:filmTitle", "filmTitle"])
         film_year_raw = _text_any(item, [f"{{{LB_NS}}}filmYear", "letterboxd:filmYear", "filmYear"])
@@ -122,7 +124,10 @@ def parse_rss_items(xml_text: str) -> pd.DataFrame:
             film_year = fallback_year
         watched_date = _parse_date(_text_any(item, [f"{{{LB_NS}}}watchedDate", "letterboxd:watchedDate", "watchedDate"])) or pub_date
         rating_raw = _text_any(item, [f"{{{LB_NS}}}memberRating", "letterboxd:memberRating", "memberRating"])
-        rating = _parse_rating(rating_raw or title)
+        # A bare numeric title (for example "1917") is not a rating. Only use the
+        # human-readable RSS title as a fallback when it contains star notation.
+        title_rating = title if any(mark in title for mark in ("★", "½", "â˜…", "Â½")) else ""
+        rating = _parse_rating(rating_raw or title_rating)
         rewatch_raw = _text_any(item, [f"{{{LB_NS}}}rewatch", "letterboxd:rewatch", "rewatch"]).lower()
         rewatch = rewatch_raw in {"yes", "true", "1"}
         tmdb_id = _text_any(item, [f"{{{TMDB_NS}}}movieId", "tmdb:movieId", "movieId"])

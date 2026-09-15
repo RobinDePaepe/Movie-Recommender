@@ -328,7 +328,9 @@ def add_heuristic_scores(candidates: pd.DataFrame, data: Dict[str, pd.DataFrame]
     out[["list_score", "list_count"]] = out[["list_score", "list_count"]].fillna(0)
     out["list_names"] = out["list_names"].fillna("")
     out["list_contribution"] = (out["list_score"].clip(upper=LIST_SCORE_CAP) * LIST_SCORE_SCALE) + (out["list_count"].clip(upper=5) * LIST_COUNT_WEIGHT)
-    out["heuristic_score"] = 3.0 + out["decade_score"] + out["liked_decade_bonus"] + out["recency_bonus"] + out["list_contribution"]
+    priority = pd.to_numeric(out.get("priority", pd.Series(index=out.index, dtype=float)), errors="coerce")
+    out["intent_bonus"] = ((priority.fillna(1) - 1) / 4 * 1.5).clip(0, 1.5)
+    out["heuristic_score"] = 3.0 + out["decade_score"] + out["liked_decade_bonus"] + out["recency_bonus"] + out["list_contribution"] + out["intent_bonus"]
     return out, decade_pref.sort_values("decade")
 
 
@@ -609,6 +611,8 @@ def explain_short(row: pd.Series, taste_mode: str = "Balanced") -> str:
         parts.append("Decade affinity")
     if row.get("recency_bonus", 0) > 0:
         parts.append("Recent")
+    if float(row.get("intent_bonus", 0) or 0) > 0:
+        parts.append("Watchlist priority")
     if row.get("metadata_found") is False and cs == 0:
         parts.append("No metadata")
     return "; ".join(parts) or "Solid candidate"
@@ -639,6 +643,8 @@ def explain_detailed(row: pd.Series, taste_mode: str = "Balanced") -> str:
         reasons.append("same decade as films you liked")
     if row.get("recency_bonus", 0) > 0:
         reasons.append("recent release bonus")
+    if float(row.get("intent_bonus", 0) or 0) > 0:
+        reasons.append("you marked it as a higher-priority watch")
     if row.get("metadata_found") is False and row.get("content_score", 0) == 0:
         reasons.append("no TMDb metadata available")
     return "; ".join([r for r in reasons if r]) or "solid candidate"
@@ -762,8 +768,8 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     candidates["taste_matches"] = candidates["taste_matches_full"].apply(lambda s: s if len(s) <= 140 else s[:137] + "...")
     candidates["why_details"] = candidates.apply(lambda row: explain_detailed(row, taste_mode), axis=1)
     candidates["why"] = candidates.apply(lambda row: explain_short(row, taste_mode), axis=1)
-    cols = ["Name", "Year", "score", "heuristic_score", "list_contribution", "content_similarity", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "theme_score", "mood_penalty", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
-    for optional_col in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "poster_url", "overview", "tmdb_vote_average", "tmdb_popularity", "discovered_from"]:
+    cols = ["Name", "Year", "score", "heuristic_score", "list_contribution", "intent_bonus", "content_similarity", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "theme_score", "mood_penalty", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
+    for optional_col in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "poster_url", "overview", "tmdb_vote_average", "tmdb_popularity", "discovered_from", "content_type", "priority", "watch_modes", "intent_reasons"]:
         if optional_col in candidates.columns:
             cols.append(optional_col)
     for c in cols:
@@ -781,11 +787,12 @@ def available_filter_values(recs: pd.DataFrame) -> Dict[str, List[str]]:
                 found.update(_as_list(item))
         values[col] = sorted(found)
     values["decades"] = sorted([d for d in recs.get("decade", pd.Series(dtype=str)).dropna().unique().tolist() if d != "Unknown"])
+    values["content_types"] = sorted(recs.get("content_type", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
     values["taste_modes"] = list(TASTE_MODES.keys())
     return values
 
 
-def apply_filters(recs: pd.DataFrame, genres=None, languages=None, moods=None, decades=None, runtime_range=None, query: str = "") -> pd.DataFrame:
+def apply_filters(recs: pd.DataFrame, genres=None, languages=None, moods=None, decades=None, runtime_range=None, query: str = "", content_types=None, available_ids=None) -> pd.DataFrame:
     filtered = recs.copy()
     for col, selected in [("genres", genres), ("languages", languages), ("moods", moods)]:
         selected = set(selected or [])
@@ -793,6 +800,10 @@ def apply_filters(recs: pd.DataFrame, genres=None, languages=None, moods=None, d
             filtered = filtered[filtered[col].apply(lambda vals: bool(selected & set(_as_list(vals))))]
     if decades:
         filtered = filtered[filtered["decade"].isin(decades)]
+    if content_types and "content_type" in filtered.columns:
+        filtered = filtered[filtered["content_type"].fillna("film").isin(content_types)]
+    if available_ids is not None:
+        filtered = filtered[filtered["movie_id"].isin(set(available_ids))]
     if runtime_range and "runtime" in filtered.columns:
         runtime = pd.to_numeric(filtered["runtime"], errors="coerce")
         filtered = filtered[(runtime.isna()) | ((runtime >= runtime_range[0]) & (runtime <= runtime_range[1]))]

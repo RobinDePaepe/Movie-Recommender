@@ -81,8 +81,21 @@ class TMDbClient:
             results = payload.get("results", [])
         return results[0] if results else None
 
+    def search_titles(self, name: str, year: Any = None) -> list[Dict[str, Any]]:
+        """Search both movie and television catalogs for manual identity review."""
+        payload = self._get("/search/multi", {"query": name, "include_adult": "false"})
+        results = [r for r in payload.get("results", []) if r.get("media_type") in {"movie", "tv"}]
+        if pd.isna(year) or year in (None, ""):
+            return results
+        target = int(year)
+        return sorted(results, key=lambda r: abs(_result_year(r) - target) if _result_year(r) else 999)
+
     def movie_details(self, tmdb_id: int) -> Dict[str, Any]:
         return self._get(f"/movie/{tmdb_id}", {"append_to_response": "credits,keywords"})
+
+    def title_details(self, tmdb_id: int, media_type: str = "movie") -> Dict[str, Any]:
+        kind = "tv" if media_type in {"tv", "series", "miniseries"} else "movie"
+        return self._get(f"/{kind}/{tmdb_id}", {"append_to_response": "credits,keywords,external_ids"})
 
     def similar_movies(self, tmdb_id: int, limit: int = 20) -> list[Dict[str, Any]]:
         payload = self._get(f"/movie/{tmdb_id}/similar", {"page": 1})
@@ -124,7 +137,7 @@ class TMDbClient:
         record: Dict[str, Any] = {"name": "", "year": None, "tmdb_found": False, "source": source}
         try:
             details = self.movie_details(int(tmdb_id))
-            record.update(flatten_tmdb_details(details))
+            record.update(flatten_tmdb_details(details, content_type="film"))
             record["tmdb_found"] = True
             record["source"] = source
             name_key = self.cache_key(record["name"], record["year"])
@@ -134,6 +147,23 @@ class TMDbClient:
             record["tmdb_id"] = tmdb_id
             record["error"] = str(exc)
             self.cache[tid_key] = record
+        self.save()
+        return record
+
+    def fetch_title_metadata(self, tmdb_id: int, media_type: str = "movie", source: str = "manual_review", force: bool = False) -> Dict[str, Any]:
+        """Fetch a confirmed movie/TV identity without guessing its catalog."""
+        key = f"tmdb:{media_type}:{int(tmdb_id)}"
+        if key in self.cache and not force:
+            return self.cache[key]
+        try:
+            details = self.title_details(int(tmdb_id), media_type)
+            record = flatten_tmdb_details(details, content_type=_content_type(details, media_type))
+            record.update({"tmdb_found": True, "source": source})
+        except Exception as exc:
+            record = {"tmdb_id": int(tmdb_id), "tmdb_found": False, "error": str(exc), "source": source}
+        self.cache[key] = record
+        if record.get("tmdb_found"):
+            self.cache[self.cache_key(record["name"], record.get("year"))] = key
         self.save()
         return record
 
@@ -152,13 +182,35 @@ class TMDbClient:
 
 
 def _release_year(details: Dict[str, Any]) -> int | None:
-    date = details.get("release_date") or ""
+    date = details.get("release_date") or details.get("first_air_date") or ""
     if len(date) >= 4 and date[:4].isdigit():
         return int(date[:4])
     return None
 
 
-def flatten_tmdb_details(details: Dict[str, Any]) -> Dict[str, Any]:
+def _result_year(result: Dict[str, Any]) -> int | None:
+    date = result.get("release_date") or result.get("first_air_date") or ""
+    return int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
+
+
+def _content_type(details: Dict[str, Any], media_type: str) -> str:
+    if media_type != "tv":
+        genres = {str(g.get("name", "")).lower() for g in details.get("genres", [])}
+        runtime = details.get("runtime") or 0
+        if "documentary" in genres:
+            return "documentary"
+        if runtime and runtime <= 40:
+            return "short"
+        return "film"
+    type_name = str(details.get("type", "")).lower()
+    episodes = details.get("number_of_episodes") or 0
+    seasons = details.get("number_of_seasons") or 0
+    if type_name in {"miniseries", "limited series"} or (seasons == 1 and episodes and episodes <= 12):
+        return "miniseries"
+    return "tv_series"
+
+
+def flatten_tmdb_details(details: Dict[str, Any], content_type: str = "film") -> Dict[str, Any]:
     credits = details.get("credits", {}) or {}
     crew = credits.get("crew", []) or []
     cast = credits.get("cast", []) or []
@@ -170,16 +222,17 @@ def flatten_tmdb_details(details: Dict[str, Any]) -> Dict[str, Any]:
     genres = [g.get("name") for g in details.get("genres", []) if g.get("name")]
     countries = [c.get("name") for c in details.get("production_countries", []) if c.get("name")]
     languages = [l.get("english_name") for l in details.get("spoken_languages", []) if l.get("english_name")]
-    keywords = [k.get("name") for k in keywords_payload.get("keywords", []) if k.get("name")]
+    keyword_rows = keywords_payload.get("keywords", []) or keywords_payload.get("results", [])
+    keywords = [k.get("name") for k in keyword_rows if k.get("name")]
     poster_path = details.get("poster_path")
 
     return {
         "name": details.get("title") or details.get("name") or "",
         "year": _release_year(details),
         "tmdb_id": details.get("id"),
-        "imdb_id": details.get("imdb_id"),
-        "tmdb_title": details.get("title"),
-        "tmdb_release_date": details.get("release_date"),
+        "imdb_id": details.get("imdb_id") or (details.get("external_ids", {}) or {}).get("imdb_id"),
+        "tmdb_title": details.get("title") or details.get("name"),
+        "tmdb_release_date": details.get("release_date") or details.get("first_air_date"),
         "overview": details.get("overview") or "",
         "genres": genres,
         "directors": directors,
@@ -188,13 +241,14 @@ def flatten_tmdb_details(details: Dict[str, Any]) -> Dict[str, Any]:
         "keywords": keywords,
         "countries": countries,
         "languages": languages,
-        "runtime": details.get("runtime"),
+        "runtime": details.get("runtime") or next(iter(details.get("episode_run_time", []) or []), None),
         "tmdb_vote_average": details.get("vote_average"),
         "tmdb_vote_count": details.get("vote_count"),
         "tmdb_popularity": details.get("popularity"),
         "poster_path": poster_path,
         "poster_url": f"{POSTER_BASE_URL}{poster_path}" if poster_path else "",
-        "tmdb_url": f"https://www.themoviedb.org/movie/{details.get('id')}",
+        "tmdb_url": f"https://www.themoviedb.org/{'tv' if content_type in {'tv_series', 'miniseries'} else 'movie'}/{details.get('id')}",
+        "content_type": content_type,
     }
 
 

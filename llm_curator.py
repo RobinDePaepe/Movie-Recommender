@@ -127,7 +127,11 @@ def _taste_block(digest: Optional[TasteDigest]) -> str:
     if digest is None or not digest.loaded or not digest.top:
         return ""
     top_str = "; ".join(
-        f"{t['name']}{f' ({t['year']})' if pd.notna(t.get('year')) else ''} {t['rating']}/5"
+        "{}{} {}/5".format(
+            t["name"],
+            " ({})".format(t["year"]) if pd.notna(t.get("year")) else "",
+            t["rating"],
+        )
         for t in digest.top
     )
     mean_note = (
@@ -153,6 +157,7 @@ def generate_filmweek(
     digest: Optional[TasteDigest] = None,
     provider: str = "anthropic",
     search_enabled: bool = True,
+    anchor_context: str = "",
 ) -> Dict[str, Any]:
     """Build a themed week around `anchor`. Returns {anchor, picks}.
 
@@ -176,12 +181,13 @@ def generate_filmweek(
     prompt = f"""You are a film curator building a weekly viewing schedule around a single anchor film.
 
 Anchor film: "{anchor}"
+{f"Verified anchor metadata (these facts override any prior knowledge): {anchor_context}" if anchor_context else ""}
 Already seen by the user: {"yes" if seen else "no"}
 Film-historical pick must be: made before {era}
 Include a director pick: {"yes, if meaningful" if with_director else "no"}
 {taste_line}{_taste_block(digest)}
 
-Assemble picks (SEPARATE from the anchor film itself):
+Assemble picks (SEPARATE from the anchor film itself). Every suggested title must be unique: never repeat the anchor or use the same film for two roles.
 1. historical — a film made before {era} that connects to the anchor both film-historically and thematically
 2. thematic — a film with strong thematic/motivic kinship
 {"3. director — another strong film by the same director. Omit if the anchor has no clear director or no strong second film." if with_director else ""}
@@ -190,6 +196,7 @@ Assemble picks (SEPARATE from the anchor film itself):
 {"5. rewatch — a well-known, widely-seen film that connects (separate from the anchor), as a rewatch option." if not seen else "The user has already seen the anchor, so it counts as the rewatch itself: add NO separate rewatch pick."}
 
 Per pick: category, title, year (number), director, and a reason of AT MOST 2 sentences that concretely explains how the film connects to the anchor (theme, motif, style, obsession/craft). No generalities, no marketing language.
+Do not invent or guess factual claims. The director pick MUST be directed by the verified anchor director when one is provided.
 {"Search at most once (only to verify the recent film) and do not write any explanation about the search. Answer directly afterwards." if search_enabled else ""}
 Respond with ONLY a valid JSON object, no surrounding text and no markdown:
 {{
@@ -215,11 +222,27 @@ Respond with ONLY a valid JSON object, no surrounding text and no markdown:
     except json.JSONDecodeError:
         raise RuntimeError("The model's answer was not valid JSON. Try again.")
 
-    picks = parsed.get("picks", []) or []
+    raw_picks = parsed.get("picks", []) or []
+    # Models occasionally assign one excellent match to multiple roles. Keep
+    # the first role in the defined order and never show the anchor as a pick.
+    parsed_anchor = parsed.get("anchor", {}) or {}
+    # The input may be "Title (YYYY)" while the model's anchor object usually
+    # contains just "Title", so compare both representations.
+    used_titles = {_norm_title(anchor), _norm_title(parsed_anchor.get("title"))}
+    picks = []
+    for pick in raw_picks:
+        if not isinstance(pick, dict):
+            continue
+        normalized_title = _norm_title(pick.get("title"))
+        if not normalized_title or normalized_title in used_titles:
+            logger.warning("Dropping duplicate Filmweek title: %r", pick.get("title"))
+            continue
+        used_titles.add(normalized_title)
+        picks.append(pick)
     picks.sort(key=lambda p: CATEGORY_ORDER.index(p.get("category")) if p.get("category") in CATEGORY_ORDER else 99)
     for p in picks:
         p["_id"] = _uid()
-    return {"anchor": parsed.get("anchor", {}) or {}, "picks": picks}
+    return {"anchor": parsed_anchor, "picks": picks}
 
 
 _ROLE_INSTRUCTIONS = {

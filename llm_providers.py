@@ -22,6 +22,8 @@ import os
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
+import requests
+
 
 @dataclass(frozen=True)
 class ProviderSpec:
@@ -113,7 +115,7 @@ PROVIDERS: Dict[str, ProviderSpec] = {
         api_key_env=(),  # local, no key
         base_url_env="OLLAMA_BASE_URL",
         default_base_url="http://localhost:11434/v1",
-        sdk_hint="pip install openai (and run Ollama locally)",
+        sdk_hint="run Ollama locally or on your network",
     ),
 }
 
@@ -192,6 +194,44 @@ def _complete_openai_compatible(spec: ProviderSpec, prompt: str, use_search: boo
     return resp.choices[0].message.content or ""
 
 
+def _complete_ollama(spec: ProviderSpec, prompt: str, use_search: bool, max_tokens: int) -> str:
+    """Call Ollama's native API without needing the OpenAI SDK.
+
+    The native endpoint honours ``think=False`` on reasoning models, unlike
+    some Ollama versions' OpenAI-compatible endpoint.
+    """
+    base_url = spec.base_url().rstrip("/")
+    root_url = base_url.rsplit("/v1", 1)[0] if base_url.endswith("/v1") else base_url
+    url = f"{root_url}/api/chat"
+    try:
+        # Corporate/system proxy variables should not intercept traffic to a
+        # private Ollama host on the local network.
+        session = requests.Session()
+        session.trust_env = False
+        response = session.post(
+            url,
+            json={
+                "model": spec.model(),
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                # Filmweek needs concise, machine-readable JSON. Disabling
+                # extended reasoning prevents reasoning models from spending
+                # the whole output budget before emitting their answer.
+                "think": False,
+                "options": {"num_predict": max_tokens},
+            },
+            timeout=180,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload["message"]["content"] or ""
+    except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
+        detail = response.text[:300] if "response" in locals() else str(exc)
+        raise RuntimeError(
+            f"Could not reach Ollama at {url} using model '{spec.model()}'. {detail}"
+        ) from exc
+
+
 def _complete_gemini(spec: ProviderSpec, prompt: str, use_search: bool, max_tokens: int) -> str:
     _require("google", spec)  # google-genai installs as the 'google.genai' namespace
     from google import genai
@@ -210,7 +250,7 @@ _BACKENDS: Dict[str, Callable[[ProviderSpec, str, bool, int], str]] = {
     "gemini": _complete_gemini,
     "openrouter": _complete_openai_compatible,
     "huggingface": _complete_openai_compatible,
-    "ollama": _complete_openai_compatible,
+    "ollama": _complete_ollama,
 }
 
 

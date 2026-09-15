@@ -11,10 +11,20 @@ from recommender import (
     _as_list,
     add_feedback_similarity,
     add_heuristic_scores,
+    apply_filters,
     build_recommendations,
     candidate_pool,
     normalize_movie_key,
 )
+
+
+def test_filters_media_type_and_availability():
+    recs = pd.DataFrame([
+        {"movie_id": "film (2020)", "content_type": "film", "Name": "Film"},
+        {"movie_id": "series (2020)", "content_type": "tv_series", "Name": "Series"},
+    ])
+    result = apply_filters(recs, content_types=["film"], available_ids=["film (2020)"])
+    assert result["movie_id"].tolist() == ["film (2020)"]
 
 
 def _metadata_data() -> tuple[dict, pd.DataFrame]:

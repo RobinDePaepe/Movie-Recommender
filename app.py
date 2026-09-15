@@ -54,13 +54,14 @@ from recommender import (
     prepare_metadata,
     save_feedback,
 )
-from tmdb_client import TMDbClient, discover_movies_from_favorites, enrich_movies, metadata_from_cache
+from tmdb_client import POSTER_BASE_URL, TMDbClient, discover_movies_from_favorites, enrich_movies, metadata_from_cache
 from omdb_client import OMDbClient, enrich_imdb_ratings
 from letterboxd_ratings import LetterboxdRatingClient, enrich_letterboxd_ratings
 from letterboxd_sync import apply_sync_overlays, sync_rss, sync_status
 from movie_database import (
     DB_PATH,
     apply_rss_overlays_to_db,
+    apply_identity_match,
     database_status,
     import_feedback_csv,
     import_letterboxd_export,
@@ -70,10 +71,22 @@ from movie_database import (
     load_data_from_db,
     load_feedback_from_db,
     load_metadata_from_db,
+    load_availability,
+    load_profiles,
+    load_watchlist_context,
+    identity_review_queue,
     load_rating_history_from_db,
     load_reflections_from_db,
     rebuild_database,
     save_curated_week,
+    save_availability,
+    save_profile,
+    save_watchlist_context,
+    set_identity_status,
+    set_content_type,
+    set_watchlist_active,
+    quarantine_list_artifacts,
+    seed_library_context_from_lists,
     remove_feedback_from_db,
     save_feedback_to_db,
     update_omdb_ratings,
@@ -440,10 +453,16 @@ if use_database:
     known_ids = set(all_movies.get("movie_id", pd.Series(dtype=str)).dropna())
     metadata_known = metadata[metadata.get("movie_id", pd.Series(dtype=str)).isin(known_ids)] if not metadata.empty else metadata
     feedback = load_feedback_from_db(db_path)
+    availability = load_availability(db_path)
+    profiles = load_profiles(db_path)
+    watchlist_context = load_watchlist_context(db_path)
 else:
     metadata = metadata_from_cache(None, cache_path=cache_path, include_all=True)
     metadata_known = metadata_from_cache(all_movies, cache_path=cache_path)
     feedback = load_feedback()
+    availability = pd.DataFrame()
+    profiles = pd.DataFrame()
+    watchlist_context = pd.DataFrame()
 
 cached_count = len(metadata) if not metadata.empty else 0
 known_count = len(metadata_known) if not metadata_known.empty else 0
@@ -451,8 +470,8 @@ found_count = int(metadata.get("tmdb_found", pd.Series(dtype=bool)).fillna(False
 
 ALL_MOODS = ["Tense", "Emotional", "Gritty", "Exciting", "Imaginative", "Light", "Reflective"]
 
-PAGES = ["Tonight's Pick", "Recommendations", "Curated Weeks", "Analysis", "Evaluation", "Reflection", "Data & Sync"]
-PAGE_ICONS = ["moon-stars", "bullseye", "calendar-week", "bar-chart", "clipboard-data", "chat-heart", "gear"]
+PAGES = ["Tonight's Pick", "Recommendations", "Curated Weeks", "Analysis", "Evaluation", "Reflection", "Library", "Data & Sync"]
+PAGE_ICONS = ["moon-stars", "bullseye", "calendar-week", "bar-chart", "clipboard-data", "chat-heart", "collection", "gear"]
 
 with st.sidebar:
     page = option_menu(
@@ -512,6 +531,21 @@ st.sidebar.caption(
 )
 
 recs, decade_prefs = build_recommendations(data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode, score_weights=score_weights)
+
+
+def attach_availability(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or availability.empty:
+        return frame
+    labeled = availability.assign(
+        _availability_label=availability["provider"].astype(str) + " (" + availability["format"].astype(str) + ")"
+    )
+    labels = labeled.groupby("movie_id")["_availability_label"].agg(
+        lambda values: ", ".join(sorted(set(values)))
+    ).rename("availability_summary")
+    return frame.merge(labels, on="movie_id", how="left")
+
+
+recs = attach_availability(recs)
 
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Rated", len(data["ratings"]))
@@ -635,7 +669,15 @@ def enrich_llm_pick(pick: dict, client: "TMDbClient | None") -> dict:
         year = pick.get("year")
         year = int(year) if year not in (None, "", 0) else None
         rec = client.fetch_movie_metadata(pick.get("title", ""), year)
-        return rec if isinstance(rec, dict) and rec.get("tmdb_found") else {}
+        if not isinstance(rec, dict) or not rec.get("tmdb_found"):
+            return {}
+        # Older cache records have ``poster_path`` but predate the derived
+        # ``poster_url`` field. Use that path so watched-library picks render
+        # identically to freshly fetched discovery picks.
+        if not rec.get("poster_url") and rec.get("poster_path"):
+            rec = dict(rec)
+            rec["poster_url"] = f"{POSTER_BASE_URL}{rec['poster_path']}"
+        return rec
     except Exception:
         return {}
 
@@ -643,8 +685,10 @@ def enrich_llm_pick(pick: dict, client: "TMDbClient | None") -> dict:
 def llm_pick_card(pick: dict, meta: dict, digest: "llm_curator.TasteDigest | None") -> None:
     cat = llm_curator.CATEGORIES.get(pick.get("category"), {"label": pick.get("category", ""), "accent": "#E8B04B"})
     title = pick.get("title", "")
-    director = pick.get("director") or (", ".join(meta.get("directors", [])[:2]) if meta.get("directors") else "")
-    year = pick.get("year") or meta.get("year") or ""
+    # TMDb is authoritative for hard facts; the LLM only supplies the curation
+    # role and prose explanation.
+    director = ", ".join(meta.get("directors", [])[:2]) if meta.get("directors") else pick.get("director", "")
+    year = meta.get("year") or pick.get("year") or ""
     poster = meta.get("poster_url")
     is_seen = bool(digest and digest.loaded and llm_curator._norm_title(title) in digest.seen_keys)
 
@@ -1164,6 +1208,16 @@ if page == "Tonight's Pick":
             "Avoid these moods", ALL_MOODS, selection_mode="multi", default=[], key="tonight_avoid_moods",
         ) or []
 
+    tc1, tc2 = st.columns(2)
+    content_type_options = available_filter_values(recs).get("content_types", []) or ["film"]
+    with tc1:
+        tonight_types = st.multiselect("Media type", content_type_options, default=["film"] if "film" in content_type_options else content_type_options[:1])
+    with tc2:
+        available_only = st.checkbox(
+            "Only titles I can watch now", value=False, disabled=availability.empty,
+            help="Uses streaming/ownership records maintained on the Library page.",
+        )
+
     if "tonight_skipped" not in st.session_state:
         st.session_state.tonight_skipped = []
 
@@ -1173,9 +1227,14 @@ if page == "Tonight's Pick":
         score_weights=score_weights,
         avoid_moods=tonight_avoid or [],
     )
+    tonight_recs = attach_availability(tonight_recs)
 
     if tonight_runtime:
         tonight_recs = apply_filters(tonight_recs, runtime_range=tonight_runtime)
+    tonight_recs = apply_filters(
+        tonight_recs, content_types=tonight_types,
+        available_ids=availability["movie_id"].tolist() if available_only else None,
+    )
 
     tonight_recs = tonight_recs[~tonight_recs["movie_id"].isin(st.session_state.tonight_skipped)].reset_index(drop=True)
 
@@ -1214,6 +1273,8 @@ if page == "Tonight's Pick":
             if mood_items:
                 html += chips_html(mood_items, accent=True)
             st.markdown(html, unsafe_allow_html=True)
+            if pd.notna(pick.get("availability_summary")) and pick.get("availability_summary"):
+                st.caption(f"Available: {pick.get('availability_summary')}")
             _disc = pick.get("discovered_from")
             if pd.notna(_disc) and str(_disc).strip():
                 st.caption(f"🔎 Discovered from: {str(_disc).strip()}")
@@ -1302,7 +1363,7 @@ elif page == "Recommendations":
         selected_moods = f1.multiselect("Mood", filter_values.get("moods", []))
         selected_decades = f2.multiselect("Decade", filter_values.get("decades", []))
         selected_genres = f3.multiselect("Genre", filter_values.get("genres", []))
-        f4, f5, f6 = st.columns(3)
+        f4, f5, f6, f7 = st.columns(4)
         selected_languages = f4.multiselect("Language", filter_values.get("languages", []))
         runtime_values = pd.to_numeric(recs.get("runtime", pd.Series(dtype=float)), errors="coerce").dropna()
         if not runtime_values.empty:
@@ -1312,8 +1373,18 @@ elif page == "Recommendations":
             runtime_range = None
             f5.caption("Runtime filter appears after TMDb metadata is cached.")
         query = f6.text_input("Search title/list/metadata")
+        selected_types = f7.multiselect(
+            "Media type", filter_values.get("content_types", []),
+            default=["film"] if "film" in filter_values.get("content_types", []) else [],
+        )
+        available_filter = st.checkbox("Only available / owned", value=False, disabled=availability.empty, key="recommendations_available")
 
-    filtered = apply_filters(recs, genres=selected_genres, languages=selected_languages, moods=selected_moods, decades=selected_decades, runtime_range=runtime_range, query=query)
+    filtered = apply_filters(
+        recs, genres=selected_genres, languages=selected_languages, moods=selected_moods,
+        decades=selected_decades, runtime_range=runtime_range, query=query,
+        content_types=selected_types,
+        available_ids=availability["movie_id"].tolist() if available_filter else None,
+    )
     anchor_note = f" | Anchor: {anchor_choice}" if anchor_movie_id else ""
     mood_note = f" | Avoiding: {', '.join(avoid_moods)}" if avoid_moods else ""
     st.caption(f"Showing {min(100, len(filtered))} of {len(filtered)} recommendations. Taste mode: {taste_mode}{anchor_note}{mood_note}.")
@@ -1486,14 +1557,34 @@ elif page == "Curated Weeks":
         )
 
         _era_val = "1970" if "1970" in llm_era else "1980"
+        _tmdb_key = get_tmdb_api_key()
+        _client = TMDbClient(api_key=_tmdb_key, cache_path=cache_path) if _tmdb_key else None
 
         if st.button("Compose the week", disabled=not (anchor_text.strip() and _prov_ready)):
             st.session_state.pop("llm_week", None)
             st.session_state["llm_rejected"] = {}
             with st.spinner("Programming your week…"):
                 try:
-                    st.session_state["llm_week"] = llm_curator.generate_filmweek(
-                        anchor=anchor_text,
+                    anchor_match = re.match(r"^(.*?)\s*\((\d{4})\)\s*$", anchor_text.strip())
+                    anchor_pick = {
+                        "title": anchor_match.group(1).strip() if anchor_match else anchor_text,
+                        "year": int(anchor_match.group(2)) if anchor_match else None,
+                    }
+                    verified_anchor = enrich_llm_pick(anchor_pick, _client)
+                    canonical_anchor = anchor_text
+                    anchor_context = ""
+                    if verified_anchor:
+                        canonical_anchor = f"{verified_anchor.get('name', anchor_text)} ({verified_anchor.get('year', '')})"
+                        directors = ", ".join(verified_anchor.get("directors", [])[:2])
+                        anchor_context = "; ".join(
+                            part for part in [
+                                f"title={verified_anchor.get('name')}",
+                                f"year={verified_anchor.get('year')}",
+                                f"director={directors}" if directors else "",
+                            ] if part
+                        )
+                    week = llm_curator.generate_filmweek(
+                        anchor=canonical_anchor,
                         seen=llm_seen,
                         era=_era_val,
                         with_director=llm_director,
@@ -1501,7 +1592,10 @@ elif page == "Curated Weeks":
                         digest=digest,
                         provider=llm_provider,
                         search_enabled=_search_ok,
+                        anchor_context=anchor_context,
                     )
+                    week["verified_anchor"] = verified_anchor
+                    st.session_state["llm_week"] = week
                 except Exception as exc:  # noqa: BLE001 — surface any API/parse error to the user
                     st.error(str(exc))
 
@@ -1510,9 +1604,12 @@ elif page == "Curated Weeks":
             _tmdb_key = get_tmdb_api_key()
             _client = TMDbClient(api_key=_tmdb_key, cache_path=cache_path) if _tmdb_key else None
             a = week.get("anchor", {})
+            verified_anchor = week.get("verified_anchor") or enrich_llm_pick(a, _client)
+            display_anchor = verified_anchor or a
             st.divider()
-            st.markdown(f"#### ★ Anchor: {a.get('title') or anchor_text}")
-            meta_bits = " · ".join(str(x) for x in [a.get("year"), a.get("director")] if x)
+            st.markdown(f"#### ★ Anchor: {display_anchor.get('name') or display_anchor.get('title') or anchor_text}")
+            anchor_director = ", ".join(verified_anchor.get("directors", [])[:2]) if verified_anchor else a.get("director", "")
+            meta_bits = " · ".join(str(x) for x in [display_anchor.get("year"), anchor_director] if x)
             if meta_bits:
                 st.caption(meta_bits)
             if a.get("note"):
@@ -1520,6 +1617,14 @@ elif page == "Curated Weeks":
 
             for pick in week.get("picks", []):
                 meta = enrich_llm_pick(pick, _client)
+                if pick.get("category") == "director" and verified_anchor:
+                    anchor_directors = set(verified_anchor.get("directors", []))
+                    pick_directors = set(meta.get("directors", []))
+                    if anchor_directors and not (anchor_directors & pick_directors):
+                        st.warning(
+                            f"Skipped \u201c{pick.get('title')}\u201d: TMDb confirms it is not directed by {anchor_director}."
+                        )
+                        continue
                 with st.container(border=True):
                     llm_pick_card(pick, meta, digest)
                     b1, b2, _ = st.columns([1, 1, 3])
@@ -1527,15 +1632,17 @@ elif page == "Curated Weeks":
                     cat = pick.get("category")
 
                     def _resim(mode: str, _pick=pick, _cat=cat):
-                        shown = [p["title"] for p in week["picks"] if p.get("category") == _cat]
+                        # Alternatives must differ from every card already in
+                        # the week, not just from this card's category.
+                        shown = [p["title"] for p in week["picks"]]
                         excl = list(dict.fromkeys(shown + rejected.get(_cat, [])))
                         with st.spinner("Searching…"):
                             try:
                                 new_pick = llm_curator.resimulate_pick(
                                     category=_cat,
-                                    anchor_title=a.get("title") or anchor_text,
-                                    anchor_year=a.get("year"),
-                                    anchor_director=a.get("director", ""),
+                                    anchor_title=display_anchor.get("name") or display_anchor.get("title") or anchor_text,
+                                    anchor_year=display_anchor.get("year"),
+                                    anchor_director=anchor_director,
                                     era=_era_val,
                                     taste_note=llm_taste,
                                     digest=digest,
@@ -1708,6 +1815,152 @@ elif page == "Reflection":
         data, metadata, tmdb_client=_reflection_client,
         db_path=db_path, use_database=use_database, cache_path=cache_path,
     )
+
+elif page == "Library":
+    st.subheader("Library & viewing context")
+    if not use_database:
+        st.info("Build the SQLite database first to manage availability, profiles, and watchlist intent.")
+    else:
+        library_tab, intent_tab, identity_tab = st.tabs(["Availability", "Watchlist intent", "Identity & media type"])
+
+        movie_options = all_movies.sort_values(["Name", "Year"]).drop_duplicates("movie_id").copy()
+        movie_options["label"] = movie_options.apply(lambda r: f"{r['Name']} ({fmt_year(r['Year'])})", axis=1)
+        option_labels = movie_options["label"].tolist()
+
+        with library_tab:
+            st.caption("Manual records are authoritative. Provider feeds can be added later without overwriting ownership entries.")
+            if st.button("Seed ownership from my Owned / 4K Letterboxd lists"):
+                result = seed_library_context_from_lists(db_path=db_path)
+                st.success(f"Added {result['availability']} availability records and {result['joint_intent']} shared-watch entries.")
+                st.rerun()
+            if option_labels:
+                with st.form("availability_form"):
+                    selected = st.selectbox("Title", option_labels, key="availability_title")
+                    a1, a2, a3 = st.columns(3)
+                    provider = a1.text_input("Service or shelf", placeholder="Netflix, MUBI, Owned")
+                    region = a2.text_input("Region", value="BE", max_chars=2)
+                    format_value = a3.selectbox("Format", ["streaming", "digital", "bluray", "4k_bluray", "dvd", "physical"])
+                    a4, a5, a6 = st.columns(3)
+                    access_type = a4.selectbox("Access", ["subscription", "owned", "rent", "buy", "free"])
+                    subtitles = a5.text_input("Subtitle languages", placeholder="nl, fr, en")
+                    expires = a6.text_input("Expires on", placeholder="YYYY-MM-DD")
+                    if st.form_submit_button("Save availability"):
+                        mid = str(movie_options.loc[movie_options["label"] == selected, "movie_id"].iloc[0])
+                        try:
+                            save_availability(mid, provider, region, format_value, access_type, subtitles, expires, db_path=db_path)
+                            st.success("Availability saved.")
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(str(exc))
+            current_availability = load_availability(db_path)
+            if current_availability.empty:
+                st.caption("No availability or ownership records yet.")
+            else:
+                st.dataframe(current_availability, hide_index=True, use_container_width=True)
+
+        with intent_tab:
+            p1, p2 = st.columns(2)
+            with p1.form("profile_form"):
+                profile_name = st.text_input("New profile name", placeholder="Partner")
+                profile_id = st.text_input("Profile id", placeholder="partner")
+                primary = st.checkbox("Primary profile")
+                if st.form_submit_button("Save profile"):
+                    try:
+                        save_profile(profile_id, profile_name, primary, db_path=db_path)
+                        st.success("Profile saved.")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+            current_profiles = load_profiles(db_path)
+            with p2:
+                st.dataframe(current_profiles[["profile_id", "name", "is_primary"]], hide_index=True, use_container_width=True)
+
+            watchlist_options = data["watchlist"].sort_values(["Name", "Year"]).copy()
+            watchlist_options["label"] = watchlist_options.apply(lambda r: f"{r['Name']} ({fmt_year(r['Year'])})", axis=1)
+            if not watchlist_options.empty:
+                with st.form("watchlist_intent_form"):
+                    selected = st.selectbox("Watchlist title", watchlist_options["label"].tolist())
+                    i1, i2, i3 = st.columns(3)
+                    profile_label = i1.selectbox("For", current_profiles["name"].tolist())
+                    priority = i2.slider("Priority", 1, 5, 3)
+                    watch_mode = i3.selectbox("Mode", ["solo", "joint", "either", "rewatch"])
+                    reason = st.text_input("Why did you add it?")
+                    timeframe = st.text_input("Desired timeframe", placeholder="this week, October, someday")
+                    if st.form_submit_button("Save intent"):
+                        mid = str(watchlist_options.loc[watchlist_options["label"] == selected, "movie_id"].iloc[0])
+                        pid = str(current_profiles.loc[current_profiles["name"] == profile_label, "profile_id"].iloc[0])
+                        save_watchlist_context(mid, pid, priority, reason, timeframe, watch_mode, db_path=db_path)
+                        st.success("Watchlist intent saved.")
+                        st.rerun()
+            current_intent = load_watchlist_context(db_path)
+            if not current_intent.empty:
+                st.dataframe(current_intent, hide_index=True, use_container_width=True)
+            watched_ids = set(data["watched"].get("movie_id", pd.Series(dtype=str)).dropna())
+            watched_on_watchlist = data["watchlist"][data["watchlist"]["movie_id"].isin(watched_ids)]
+            if not watched_on_watchlist.empty:
+                with st.expander(f"Watched titles still on watchlist ({len(watched_on_watchlist)})"):
+                    for _, row in watched_on_watchlist.iterrows():
+                        c1, c2, c3 = st.columns([4, 1, 1])
+                        c1.write(f"{row['Name']} ({fmt_year(row['Year'])})")
+                        if c2.button("Rewatch", key=f"rewatch_{row['movie_id']}"):
+                            save_watchlist_context(row["movie_id"], "me", 3, "Keep for rewatch", "", "rewatch", db_path=db_path)
+                            st.rerun()
+                        if c3.button("Remove", key=f"remove_wl_{row['movie_id']}"):
+                            set_watchlist_active(row["movie_id"], False, db_path=db_path)
+                            st.rerun()
+
+        with identity_tab:
+            q1, q2 = st.columns(2)
+            with q1:
+                if st.button("Quarantine imported list headers"):
+                    changed = quarantine_list_artifacts(db_path=db_path)
+                    st.success(f"Quarantined {changed} list-header records. No rows were deleted.")
+                    st.rerun()
+            queue = identity_review_queue(db_path)
+            q2.metric("Needs identity review", len(queue[queue["record_status"] == "active"]))
+            if not queue.empty:
+                st.dataframe(queue, hide_index=True, use_container_width=True)
+                queue = queue.copy()
+                queue["label"] = queue.apply(lambda r: f"{r['Name']} ({fmt_year(r['Year'])})", axis=1)
+                review_label = st.selectbox("Review unresolved title", queue["label"].tolist())
+                review_row = queue.loc[queue["label"] == review_label].iloc[0]
+                rb1, rb2 = st.columns(2)
+                if rb1.button("Quarantine as non-title"):
+                    set_identity_status(review_row["movie_id"], "quarantined", note="Marked as non-title in Library review", db_path=db_path)
+                    st.rerun()
+                if rb2.button("Keep active without TMDb"):
+                    set_identity_status(review_row["movie_id"], "active", note="Valid title; no TMDb match", db_path=db_path)
+                    st.rerun()
+
+                key = get_tmdb_api_key()
+                if st.button("Search TMDb movie + TV catalogs", disabled=not bool(key)):
+                    client = TMDbClient(api_key=key, cache_path=cache_path)
+                    st.session_state["identity_results"] = client.search_titles(review_row["Name"], review_row["Year"])
+                results = st.session_state.get("identity_results", [])
+                for idx, result in enumerate(results[:8]):
+                    title = result.get("title") or result.get("name")
+                    year = str(result.get("release_date") or result.get("first_air_date") or "")[:4]
+                    media = result.get("media_type", "movie")
+                    c1, c2 = st.columns([4, 1])
+                    c1.write(f"{title} ({year}) · {media} · TMDb {result.get('id')}")
+                    if c2.button("Use match", key=f"identity_match_{idx}_{result.get('id')}"):
+                        client = TMDbClient(api_key=key, cache_path=cache_path)
+                        confirmed = client.fetch_title_metadata(int(result["id"]), media)
+                        apply_identity_match(review_row["movie_id"], confirmed, db_path=db_path)
+                        st.success("Identity confirmed and metadata attached.")
+                        st.rerun()
+
+            typed = metadata[["movie_id", "name", "year", "content_type"]].copy() if not metadata.empty and "content_type" in metadata.columns else pd.DataFrame()
+            if not typed.empty:
+                typed["label"] = typed.apply(lambda r: f"{r['name']} ({fmt_year(r['year'])})", axis=1)
+                with st.form("media_type_form"):
+                    label = st.selectbox("Correct media type", typed.sort_values("label")["label"].tolist())
+                    content_type = st.selectbox("Type", ["film", "short", "documentary", "tv_series", "miniseries", "concert_film"])
+                    if st.form_submit_button("Update media type"):
+                        mid = str(typed.loc[typed["label"] == label, "movie_id"].iloc[0])
+                        set_content_type(mid, content_type, db_path=db_path)
+                        st.success("Media type updated.")
+                        st.rerun()
 
 else:  # "Data & Sync"
     st.subheader("Data & Sync")

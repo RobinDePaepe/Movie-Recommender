@@ -135,3 +135,46 @@ def test_init_db_is_idempotent_and_status_reports(db):
 
 def test_database_status_missing_file(tmp_path):
     assert mdb.database_status(tmp_path / "nope.sqlite") == {"exists": False}
+
+
+def test_export_watch_date_is_marked_unknown_and_excluded_from_diary(db):
+    mdb.init_db(db)
+    with mdb.connect(db) as conn:
+        mid = mdb.upsert_movie(conn, "Inception", 2010)
+        conn.execute(
+            "INSERT INTO watched_events(movie_id,watched_date,source,source_event_id,date_kind,created_at) VALUES (?,?,?,?,?,?)",
+            (mid, "2026-01-04", "letterboxd_export", "watched:old", "exact", mdb.utc_now()),
+        )
+    mdb.init_db(db)
+    loaded = mdb.load_data_from_db(db)
+    assert len(loaded["watched"]) == 1
+    assert pd.isna(loaded["watched"].iloc[0]["Date"])
+    assert loaded["diary"].empty
+
+
+def test_availability_profiles_and_intent_roundtrip(db):
+    mdb.init_db(db)
+    with mdb.connect(db) as conn:
+        mid = mdb.upsert_movie(conn, "Inception", 2010)
+    mdb.save_profile("partner", "Partner", db_path=db)
+    mdb.save_availability(mid, "Owned", format_value="4k_bluray", access_type="owned", db_path=db)
+    mdb.save_watchlist_context(mid, "partner", 5, "Movie night", "this week", "joint", db_path=db)
+    assert mdb.load_availability(db).iloc[0]["format"] == "4k_bluray"
+    intent = mdb.load_watchlist_context(db).iloc[0]
+    assert intent["priority"] == 5
+    assert intent["watch_mode"] == "joint"
+
+
+def test_watch_context_roundtrip(db):
+    mdb.init_db(db)
+    with mdb.connect(db) as conn:
+        mid = mdb.upsert_movie(conn, "Inception", 2010)
+        cur = conn.execute(
+            "INSERT INTO watched_events(movie_id,watched_date,source,source_event_id,date_kind,created_at) VALUES (?,?,?,?,?,?)",
+            (mid, "2026-01-01", "letterboxd_diary", "diary:1", "exact", mdb.utc_now()),
+        )
+        event_id = cur.lastrowid
+    mdb.save_watch_context(event_id, "curious", "partner", "cinema", "Great crowd", True, db_path=db)
+    context = mdb.load_watch_context(db).iloc[0]
+    assert context["mood"] == "curious"
+    assert context["would_rewatch"] == 1
