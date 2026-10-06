@@ -192,6 +192,17 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
                 PRIMARY KEY(movie_id, profile_id)
             );
 
+            CREATE TABLE IF NOT EXISTS profile_preferences (
+                movie_id TEXT NOT NULL REFERENCES movies(movie_id) ON DELETE CASCADE,
+                profile_id TEXT NOT NULL REFERENCES profiles(profile_id) ON DELETE CASCADE,
+                rating REAL,
+                liked INTEGER NOT NULL DEFAULT 0,
+                veto INTEGER NOT NULL DEFAULT 0,
+                note TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(movie_id, profile_id)
+            );
+
             CREATE TABLE IF NOT EXISTS title_availability (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 movie_id TEXT NOT NULL REFERENCES movies(movie_id) ON DELETE CASCADE,
@@ -505,7 +516,7 @@ def rebuild_database(export_zip: str | Path = "data/letterboxd_export.zip", cach
         init_db(path)
         with connect(path) as conn:
             for table in [
-                "profiles", "watchlist_context", "title_availability", "movie_notes",
+                "profiles", "watchlist_context", "profile_preferences", "title_availability", "movie_notes",
                 "reflections", "curated_weeks", "title_identity_review",
             ]:
                 preserved[table] = [dict(row) for row in conn.execute(f"SELECT * FROM {table}").fetchall()]
@@ -560,7 +571,11 @@ def load_data_from_db(db_path: str | Path = DB_PATH) -> Dict[str, pd.DataFrame]:
         watchlist = pd.read_sql_query(f"SELECT m.name AS Name, m.year AS Year, wl.added_at AS Date, m.letterboxd_uri AS 'Letterboxd URI', m.movie_id,MAX(wc.priority) AS priority,GROUP_CONCAT(DISTINCT wc.watch_mode) AS watch_modes,GROUP_CONCAT(DISTINCT wc.reason) AS intent_reasons FROM watchlist wl JOIN movies m USING(movie_id) LEFT JOIN watchlist_context wc USING(movie_id) WHERE wl.active=1 AND {active} GROUP BY m.movie_id", conn)
         likes = pd.read_sql_query(f"SELECT m.name AS Name, m.year AS Year, l.liked_at AS Date, m.letterboxd_uri AS 'Letterboxd URI', m.movie_id FROM likes l JOIN movies m USING(movie_id) WHERE {active}", conn)
         lists = pd.read_sql_query(f"SELECT le.position AS Position, m.name AS Name, m.year AS Year, m.letterboxd_uri AS URL, le.list_name AS source_list, m.movie_id FROM list_entries le JOIN movies m USING(movie_id) WHERE {active}", conn)
-    return {"ratings": ratings, "watched": watched, "diary": diary, "watchlist": watchlist, "likes": likes, "lists": lists}
+        profile_preferences = pd.read_sql_query(
+            "SELECT pp.*,m.name AS Name,m.year AS Year,p.name AS profile_name "
+            "FROM profile_preferences pp JOIN movies m USING(movie_id) JOIN profiles p USING(profile_id)", conn,
+        )
+    return {"ratings": ratings, "watched": watched, "diary": diary, "watchlist": watchlist, "likes": likes, "lists": lists, "profile_preferences": profile_preferences}
 
 
 def load_metadata_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:
@@ -640,6 +655,35 @@ def load_watchlist_context(db_path: str | Path = DB_PATH) -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT wc.*,m.name AS Name,m.year AS Year,p.name AS profile_name "
             "FROM watchlist_context wc JOIN movies m USING(movie_id) JOIN profiles p USING(profile_id)", conn,
+        )
+
+
+def save_profile_preference(
+    movie_id_value: str, profile_id: str, rating: float | None = None,
+    liked: bool = False, veto: bool = False, note: str = "",
+    db_path: str | Path = DB_PATH,
+) -> None:
+    init_db(db_path)
+    if rating is not None and not 0.5 <= float(rating) <= 5.0:
+        raise ValueError("Rating must be between 0.5 and 5.0.")
+    # A very low explicit rating is a strong dislike even if the checkbox was missed.
+    effective_veto = bool(veto or (rating is not None and float(rating) <= 1.5))
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO profile_preferences(movie_id,profile_id,rating,liked,veto,note,updated_at) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(movie_id,profile_id) DO UPDATE SET "
+            "rating=excluded.rating,liked=excluded.liked,veto=excluded.veto,note=excluded.note,updated_at=excluded.updated_at",
+            (movie_id_value, profile_id, rating, int(liked), int(effective_veto), note.strip(), utc_now()),
+        )
+
+
+def load_profile_preferences(db_path: str | Path = DB_PATH) -> pd.DataFrame:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        return pd.read_sql_query(
+            "SELECT pp.*,m.name AS Name,m.year AS Year,p.name AS profile_name "
+            "FROM profile_preferences pp JOIN movies m USING(movie_id) JOIN profiles p USING(profile_id) "
+            "ORDER BY p.name,m.name", conn,
         )
 
 
@@ -872,7 +916,7 @@ def database_status(db_path: str | Path = DB_PATH) -> Dict[str, Any]:
         return {"exists": False}
     init_db(db_path)
     with connect(db_path) as conn:
-        tables = ["movies", "ratings", "watched_events", "watchlist", "likes", "list_entries", "movie_metadata", "feedback", "rating_history", "sync_runs", "reflections", "curated_weeks", "profiles", "watchlist_context", "title_availability", "watch_context", "title_identity_review", "movie_notes"]
+        tables = ["movies", "ratings", "watched_events", "watchlist", "likes", "list_entries", "movie_metadata", "feedback", "rating_history", "sync_runs", "reflections", "curated_weeks", "profiles", "watchlist_context", "profile_preferences", "title_availability", "watch_context", "title_identity_review", "movie_notes"]
         status = {"exists": True, "path": str(Path(db_path)), "size_mb": round(Path(db_path).stat().st_size / 1024 / 1024, 2)}
         for t in tables:
             status[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]

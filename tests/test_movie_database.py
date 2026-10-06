@@ -178,3 +178,14 @@ def test_watch_context_roundtrip(db):
     context = mdb.load_watch_context(db).iloc[0]
     assert context["mood"] == "curious"
     assert context["would_rewatch"] == 1
+
+
+def test_profile_preference_low_rating_becomes_veto(db):
+    mdb.init_db(db)
+    with mdb.connect(db) as conn:
+        mid = mdb.upsert_movie(conn, "Bad Fit", 2020)
+    mdb.save_profile("partner", "Partner", db_path=db)
+    mdb.save_profile_preference(mid, "partner", rating=1.5, note="Not for me", db_path=db)
+    pref = mdb.load_profile_preferences(db).iloc[0]
+    assert pref["rating"] == 1.5
+    assert pref["veto"] == 1

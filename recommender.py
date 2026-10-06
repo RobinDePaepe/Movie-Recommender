@@ -31,13 +31,27 @@ HEURISTIC_WEIGHT = 0.5
 ANCHOR_FOCUS_SCALE = 0.4
 
 TASTE_MODES: Dict[str, Dict[str, Any]] = {
-    "Balanced": {"terms": [], "runtime": None},
-    "Comfort movie": {"terms": ["Light", "Comedy", "Family", "Animation", "Romance", "feel-good"], "runtime": (0, 130)},
-    "Prestige drama": {"terms": ["Drama", "History", "Biography", "Reflective", "director", "novel"], "runtime": None},
-    "Weird / arthouse": {"terms": ["Imaginative", "Fantasy", "Science Fiction", "surreal", "dream", "experimental"], "runtime": None},
-    "Date night": {"terms": ["Romance", "Comedy", "Emotional", "Music", "Light"], "runtime": (0, 140)},
-    "Short runtime": {"terms": [], "runtime": (0, 100)},
-    "High confidence": {"terms": [], "runtime": None, "min_metadata": True},
+    "Balanced": {"positive": {}, "negative": {}, "runtime": None},
+    "Comfort movie": {
+        "positive": {"light": 0.9, "comedy": 0.7, "family": 0.65, "animation": 0.5, "romance": 0.35, "feel-good": 0.9},
+        "negative": {"tense": 0.65, "gritty": 0.55, "horror": 0.7, "war": 0.55},
+        "runtime": (0, 130), "runtime_bonus": 0.4,
+    },
+    "Prestige drama": {
+        "positive": {"drama": 0.65, "history": 0.65, "biography": 0.7, "reflective": 0.75, "character study": 0.7, "novel": 0.35},
+        "negative": {}, "runtime": None,
+    },
+    "Weird / arthouse": {
+        "positive": {"imaginative": 0.8, "fantasy": 0.45, "science fiction": 0.45, "surreal": 0.9, "dream": 0.65, "experimental": 0.9, "avant-garde": 0.9},
+        "negative": {}, "runtime": None,
+    },
+    "Date night": {
+        "positive": {"romance": 0.85, "comedy": 0.65, "music": 0.4, "light": 0.6, "emotional": 0.3},
+        "negative": {"gritty": 0.5, "war": 0.6, "serial killer": 0.7},
+        "runtime": (0, 140), "runtime_bonus": 0.35,
+    },
+    "Short runtime": {"positive": {}, "negative": {}, "runtime": (0, 100), "runtime_bonus": 2.0, "over_runtime_penalty": 0.8},
+    "High confidence": {"positive": {}, "negative": {}, "runtime": None, "min_metadata": True},
 }
 
 # Feedback labels for taste tuning. Weights scale the content-similarity channel, so the
@@ -397,12 +411,44 @@ def _rating_weight(rating: float) -> float:
     return max(0.1, (float(rating) - 3.0) / 2.0)
 
 
-def add_content_similarity(candidates: pd.DataFrame, ratings: pd.DataFrame, likes: pd.DataFrame, metadata: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+def reliable_watch_counts(watch_history: pd.DataFrame | None) -> Dict[str, int]:
+    """Return conservative counts based only on diary/RSS viewing events.
+
+    A single event explicitly marked as a rewatch implies at least two lifetime
+    viewings even when the original viewing predates the diary export.
+    """
+    if watch_history is None or watch_history.empty or "movie_id" not in watch_history.columns:
+        return {}
+    history = watch_history.dropna(subset=["movie_id"]).copy()
+    if "Date Kind" in history.columns:
+        history = history[history["Date Kind"].fillna("exact") == "exact"]
+    if history.empty:
+        return {}
+
+    def is_rewatch(value: Any) -> bool:
+        return str(value).strip().lower() in {"1", "true", "yes"}
+
+    counts: Dict[str, int] = {}
+    for mid, rows in history.groupby("movie_id"):
+        event_count = len(rows)
+        explicit_rewatch = rows.get("Rewatch", pd.Series(False, index=rows.index)).apply(is_rewatch).any()
+        counts[str(mid)] = max(event_count, 2 if explicit_rewatch else 1)
+    return counts
+
+
+def add_content_similarity(
+    candidates: pd.DataFrame,
+    ratings: pd.DataFrame,
+    likes: pd.DataFrame,
+    metadata: pd.DataFrame,
+    watch_history: pd.DataFrame | None = None,
+) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
     import numpy as np
     meta = prepare_metadata(metadata)
     if meta.empty:
         candidates["content_similarity"] = 0.0
         candidates["content_score"] = 0.0
+        candidates["rewatch_score"] = 0.0
         candidates["metadata_found"] = False
         candidates["taste_matches"] = ""
         return candidates, {}
@@ -419,6 +465,7 @@ def add_content_similarity(candidates: pd.DataFrame, ratings: pd.DataFrame, like
     if positive_meta.empty or cand["feature_text"].str.len().sum() == 0:
         cand["content_similarity"] = 0.0
         cand["content_score"] = 0.0
+        cand["rewatch_score"] = 0.0
         cand["taste_matches"] = ""
         return cand, {}
 
@@ -443,6 +490,12 @@ def add_content_similarity(candidates: pd.DataFrame, ratings: pd.DataFrame, like
         for mid in positive_meta["movie_id"]
     ])
     pos_sims = cosine_similarity(cand_matrix, pos_matrix)
+    watch_counts = reliable_watch_counts(watch_history)
+    rewatch_multipliers = np.array([
+        min(1.75, 1.0 + 0.25 * (watch_counts.get(str(mid), 1) - 1))
+        for mid in positive_meta["movie_id"]
+    ])
+    pos_weights = pos_weights * rewatch_multipliers
     weight_sum = pos_weights.sum()
     weighted_pos_sim = (pos_sims * pos_weights).sum(axis=1) / weight_sum if weight_sum > 0 else pos_sims.mean(axis=1)
 
@@ -456,9 +509,80 @@ def add_content_similarity(candidates: pd.DataFrame, ratings: pd.DataFrame, like
     cand["content_similarity"] = weighted_pos_sim - neg_penalty
     max_sim = cand["content_similarity"].max()
     cand["content_score"] = (cand["content_similarity"] / max_sim * 4.0) if max_sim and max_sim > 0 else 0.0
+    rewatch_mask = rewatch_multipliers > 1.0
+    if rewatch_mask.any():
+        raw_rewatch = (pos_sims[:, rewatch_mask] * (rewatch_multipliers[rewatch_mask] - 1.0)).sum(axis=1)
+        raw_rewatch /= max(float((rewatch_multipliers[rewatch_mask] - 1.0).sum()), 1e-9)
+        max_rewatch = raw_rewatch.max()
+        cand["rewatch_score"] = raw_rewatch / max_rewatch * 1.25 if max_rewatch > 0 else 0.0
+    else:
+        cand["rewatch_score"] = 0.0
     taste_profile = build_taste_profile(positive_meta)
     cand["taste_matches"] = cand.apply(lambda row: taste_match_text(row, taste_profile), axis=1)
     return cand, taste_profile
+
+
+def add_joint_profile_score(
+    candidates: pd.DataFrame,
+    metadata: pd.DataFrame | None,
+    preferences: pd.DataFrame | None,
+    profile_ids: List[str] | None,
+) -> pd.DataFrame:
+    """Blend selected profiles while protecting the least-satisfied profile.
+
+    The blend is 70% mean fit and 30% minimum fit. Explicit vetoes (including
+    saved ratings <= 1.5) remove the title from the joint candidate pool.
+    Profiles without at least one positive signal do not dilute the result.
+    """
+    out = candidates.copy()
+    out["joint_profile_score"] = pd.to_numeric(out.get("content_score", 0), errors="coerce").fillna(0.0)
+    out["joint_profile_count"] = 1
+    out["profile_veto"] = False
+    selected = list(dict.fromkeys(profile_ids or ["me"]))
+    prefs = preferences.copy() if preferences is not None else pd.DataFrame()
+    if prefs.empty or "profile_id" not in prefs.columns:
+        return out
+
+    veto_rows = prefs[prefs["profile_id"].isin(selected)].copy()
+    veto_mask = veto_rows.get("veto", pd.Series(0, index=veto_rows.index)).fillna(0).astype(bool)
+    veto_rating = pd.to_numeric(veto_rows.get("rating"), errors="coerce") <= 1.5
+    veto_ids = set(veto_rows.loc[veto_mask | veto_rating, "movie_id"].dropna())
+    out["profile_veto"] = out["movie_id"].isin(veto_ids)
+
+    score_series: List[pd.Series] = []
+    if "me" in selected:
+        score_series.append(out.set_index("movie_id")["joint_profile_score"].rename("me"))
+
+    base_cols = [c for c in ["Name", "Year", "movie_id", "Letterboxd URI"] if c in out.columns]
+    base_candidates = out[base_cols].copy()
+    for profile_id in selected:
+        if profile_id == "me":
+            continue
+        profile = prefs[prefs["profile_id"] == profile_id].copy()
+        profile["Rating"] = pd.to_numeric(profile.get("rating"), errors="coerce")
+        liked = profile.get("liked", pd.Series(0, index=profile.index)).fillna(0).astype(bool)
+        has_positive = (profile["Rating"] >= 4.0).any() or liked.any()
+        if not has_positive:
+            continue
+        profile_likes = profile.loc[liked, ["movie_id"]].drop_duplicates()
+        scored, _ = add_content_similarity(
+            base_candidates,
+            profile[["movie_id", "Rating"]],
+            profile_likes,
+            metadata if metadata is not None else pd.DataFrame(),
+        )
+        score_series.append(scored.set_index("movie_id")["content_score"].rename(profile_id))
+
+    if not score_series:
+        out["joint_profile_score"] = 0.0
+        out["joint_profile_count"] = 0
+        return out
+    score_frame = pd.concat(score_series, axis=1).reindex(out["movie_id"])
+    mean_fit = score_frame.mean(axis=1)
+    minimum_fit = score_frame.min(axis=1)
+    out["joint_profile_score"] = (0.7 * mean_fit + 0.3 * minimum_fit).to_numpy()
+    out["joint_profile_count"] = len(score_series)
+    return out
 
 
 DEFAULT_ENTITY_COL_WEIGHTS = {"directors": 1.5, "writers": 0.8, "cast": 0.4}
@@ -571,20 +695,38 @@ def add_feedback_similarity(candidates: pd.DataFrame, feedback: pd.DataFrame, me
     return out.drop(columns=["direct_score"], errors="ignore")
 
 
-def taste_mode_score(row: pd.Series, taste_mode: str) -> float:
+def taste_mode_evidence(row: pd.Series, taste_mode: str) -> Tuple[float, List[str]]:
     config = TASTE_MODES.get(taste_mode, TASTE_MODES["Balanced"])
     score = 0.0
-    text = " ".join(_as_list(row.get("genres", [])) + _as_list(row.get("moods", [])) + _as_list(row.get("keywords", []))).lower()
-    for term in config.get("terms", []):
-        if str(term).lower() in text:
-            score += 0.35
+    matches: List[str] = []
+    text = " ".join(
+        _as_list(row.get("genres", []))
+        + _as_list(row.get("moods", []))
+        + _as_list(row.get("keywords", []))
+        + [str(row.get("overview", "") or "")]
+    ).lower()
+    for term, weight in config.get("positive", {}).items():
+        if term in text:
+            score += float(weight)
+            matches.append(term)
+    for term, weight in config.get("negative", {}).items():
+        if term in text:
+            score -= float(weight)
     rt_range = config.get("runtime")
     runtime = pd.to_numeric(row.get("runtime"), errors="coerce")
     if rt_range and pd.notna(runtime) and rt_range[0] <= runtime <= rt_range[1]:
-        score += 0.8
+        score += float(config.get("runtime_bonus", 0.8))
+        matches.append(f"{int(runtime)} min")
+    elif rt_range and pd.notna(runtime) and runtime > rt_range[1] and config.get("over_runtime_penalty"):
+        score -= float(config["over_runtime_penalty"])
     if config.get("min_metadata") and row.get("metadata_found") and row.get("content_score", 0) >= 2.0:
-        score += 1.0
-    return min(score, 2.0)
+        score += 2.0
+        matches.append("strong metadata-backed match")
+    return max(-1.5, min(score, 3.0)), matches[:4]
+
+
+def taste_mode_score(row: pd.Series, taste_mode: str) -> float:
+    return taste_mode_evidence(row, taste_mode)[0]
 
 
 def explain_short(row: pd.Series, taste_mode: str = "Balanced") -> str:
@@ -602,7 +744,12 @@ def explain_short(row: pd.Series, taste_mode: str = "Balanced") -> str:
     if abs(fb) > 0.2:
         parts.append("Taste feedback: positive" if fb > 0 else "Taste feedback: negative")
     if float(row.get("taste_mode_score", 0) or 0) > 0:
-        parts.append(taste_mode)
+        mode_matches = str(row.get("taste_mode_matches", "") or "")
+        parts.append(f"{taste_mode}: {mode_matches}" if mode_matches else taste_mode)
+    if float(row.get("rewatch_score", 0) or 0) > 0.25:
+        parts.append("Similar to your rewatches")
+    if int(row.get("joint_profile_count", 1) or 0) > 1:
+        parts.append(f"Blended for {int(row.get('joint_profile_count'))} profiles")
     if float(row.get("entity_score", 0) or 0) > 0.3:
         parts.append("Trusted director/cast")
     if int(row.get("list_count", 0) or 0) > 0:
@@ -634,7 +781,12 @@ def explain_detailed(row: pd.Series, taste_mode: str = "Balanced") -> str:
     elif entity < -0.3:
         reasons.append("involves someone you've rated poorly in the past")
     if float(row.get("taste_mode_score", 0) or 0) > 0:
-        reasons.append(f"fits the selected taste mode: {taste_mode}")
+        mode_matches = str(row.get("taste_mode_matches", "") or "")
+        reasons.append(f"fits {taste_mode.lower()} via {mode_matches}" if mode_matches else f"fits the selected taste mode: {taste_mode}")
+    if float(row.get("rewatch_score", 0) or 0) > 0.25:
+        reasons.append("resembles positive films you have deliberately rewatched")
+    if int(row.get("joint_profile_count", 1) or 0) > 1:
+        reasons.append("balances average fit with protection for the least-satisfied selected profile")
     if row.get("list_count", 0) > 0:
         reasons.append(f"appears in {int(row.get('list_count', 0))} lists: {row.get('list_names', '')}")
     if row.get("decade_score", 0) > 0.2:
@@ -703,7 +855,7 @@ def apply_mood_avoidance(candidates: pd.DataFrame, avoid_moods: List[str], penal
     return out
 
 
-def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame | None = None, mode: str = "watchlist", feedback: pd.DataFrame | None = None, taste_mode: str = "Balanced", score_weights: Dict[str, float] | None = None, anchor_movie_id: str | None = None, avoid_moods: List[str] | None = None, anchor_focus: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame | None = None, mode: str = "watchlist", feedback: pd.DataFrame | None = None, taste_mode: str = "Balanced", score_weights: Dict[str, float] | None = None, anchor_movie_id: str | None = None, avoid_moods: List[str] | None = None, anchor_focus: bool = True, profile_ids: List[str] | None = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     candidates = candidate_pool(data, mode=mode)
     meta = prepare_metadata(metadata)
     if mode == "outside_watchlist" and not meta.empty:
@@ -728,9 +880,19 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     if unreleased:
         candidates = candidates[~candidates["movie_id"].isin(unreleased)]
     candidates, decade_prefs = add_heuristic_scores(candidates, data)
-    candidates, taste_profile = add_content_similarity(candidates, data["ratings"], data["likes"], metadata if metadata is not None else pd.DataFrame())
+    candidates, taste_profile = add_content_similarity(
+        candidates, data["ratings"], data["likes"],
+        metadata if metadata is not None else pd.DataFrame(),
+        watch_history=data.get("diary", pd.DataFrame()),
+    )
+    candidates = add_joint_profile_score(
+        candidates, metadata, data.get("profile_preferences", pd.DataFrame()), profile_ids,
+    )
+    candidates = candidates[~candidates["profile_veto"]].copy()
     candidates = add_feedback_similarity(candidates, feedback if feedback is not None else pd.DataFrame(), metadata)
-    candidates["taste_mode_score"] = candidates.apply(lambda row: taste_mode_score(row, taste_mode), axis=1)
+    mode_results = candidates.apply(lambda row: taste_mode_evidence(row, taste_mode), axis=1)
+    candidates["taste_mode_score"] = [result[0] for result in mode_results]
+    candidates["taste_mode_matches"] = [", ".join(result[1]) for result in mode_results]
     candidates = add_entity_affinity(candidates, data["ratings"], metadata)
     candidates = add_anchor_similarity(candidates, anchor_movie_id, metadata)
     candidates = add_theme_similarity(candidates, data["ratings"], data["likes"], metadata)
@@ -742,6 +904,7 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     anchor_w = float(weights.get("anchor", 1.0))
     theme_w = float(weights.get("theme", 1.0))
     feedback_w = float(weights.get("feedback", 1.0))
+    rewatch_w = float(weights.get("rewatch", 1.0))
     # Anchor-focus: when a film is anchored, ease off the personal-taste signals so the
     # anchor leads ("show me films like THIS"), instead of global taste cancelling it.
     if anchor_movie_id and anchor_focus:
@@ -754,8 +917,9 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     candidates["score"] = (
         base_heuristic
         + candidates["list_contribution"] * list_w
-        + candidates["content_score"] * content_w
+        + candidates["joint_profile_score"] * content_w
         + candidates["feedback_score"] * feedback_w
+        + candidates["rewatch_score"] * rewatch_w
         + candidates["taste_mode_score"]
         + candidates["entity_score"] * entity_w
         + candidates["anchor_score"] * anchor_w
@@ -768,7 +932,7 @@ def build_recommendations(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame 
     candidates["taste_matches"] = candidates["taste_matches_full"].apply(lambda s: s if len(s) <= 140 else s[:137] + "...")
     candidates["why_details"] = candidates.apply(lambda row: explain_detailed(row, taste_mode), axis=1)
     candidates["why"] = candidates.apply(lambda row: explain_short(row, taste_mode), axis=1)
-    cols = ["Name", "Year", "score", "heuristic_score", "list_contribution", "intent_bonus", "content_similarity", "content_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "theme_score", "mood_penalty", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
+    cols = ["Name", "Year", "score", "heuristic_score", "list_contribution", "intent_bonus", "content_similarity", "content_score", "joint_profile_score", "joint_profile_count", "feedback_score", "rewatch_score", "taste_mode_score", "taste_mode_matches", "entity_score", "anchor_score", "theme_score", "mood_penalty", "why", "why_details", "Letterboxd URI", "movie_id", "decade", "list_names", "taste_matches", "list_names_full", "taste_matches_full"]
     for optional_col in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "poster_url", "overview", "tmdb_vote_average", "tmdb_popularity", "discovered_from", "content_type", "priority", "watch_modes", "intent_reasons"]:
         if optional_col in candidates.columns:
             cols.append(optional_col)
@@ -813,6 +977,30 @@ def apply_filters(recs: pd.DataFrame, genres=None, languages=None, moods=None, d
         existing_cols = [c for c in searchable_cols if c in filtered.columns]
         filtered = filtered[filtered[existing_cols].astype(str).apply(lambda row: q in " ".join(row).lower(), axis=1)]
     return filtered
+
+
+def recommendation_impact(before: pd.DataFrame, after: pd.DataFrame, limit: int = 8) -> pd.DataFrame:
+    """Summarise score/rank movement between two recommendation snapshots."""
+    required = {"movie_id", "Name", "score"}
+    if before is None or after is None or not required.issubset(before.columns) or not required.issubset(after.columns):
+        return pd.DataFrame()
+    old = before.drop_duplicates("movie_id").reset_index(drop=True).copy()
+    new = after.drop_duplicates("movie_id").reset_index(drop=True).copy()
+    old["rank_before"] = old.index + 1
+    new["rank_after"] = new.index + 1
+    merged = old[["movie_id", "Name", "score", "rank_before"]].merge(
+        new[["movie_id", "Name", "score", "rank_after"]],
+        on="movie_id", how="inner", suffixes=("_before", "_after"),
+    )
+    if merged.empty:
+        return merged
+    merged["Name"] = merged["Name_after"].fillna(merged["Name_before"])
+    merged["score_change"] = merged["score_after"] - merged["score_before"]
+    merged["rank_change"] = merged["rank_before"] - merged["rank_after"]
+    merged["_impact"] = merged["score_change"].abs() + merged["rank_change"].abs() * 0.05
+    return merged.sort_values("_impact", ascending=False).head(limit)[
+        ["movie_id", "Name", "score_before", "score_after", "score_change", "rank_before", "rank_after", "rank_change"]
+    ].reset_index(drop=True)
 
 
 def evaluate_historical_predictions(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame | None = None) -> Tuple[pd.DataFrame, Dict[str, float]]:

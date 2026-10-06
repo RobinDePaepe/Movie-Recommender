@@ -41,6 +41,7 @@ import llm_providers
 from rate_review import render_reflection_panel
 from recommender import (
     ANCHOR_FOCUS_SCALE,
+    HEURISTIC_WEIGHT,
     apply_filters,
     available_filter_values,
     build_recommendations,
@@ -52,6 +53,7 @@ from recommender import (
     remove_feedback_from_csv,
     load_letterboxd,
     prepare_metadata,
+    recommendation_impact,
     save_feedback,
 )
 from tmdb_client import POSTER_BASE_URL, TMDbClient, discover_movies_from_favorites, enrich_movies, metadata_from_cache
@@ -73,6 +75,7 @@ from movie_database import (
     load_metadata_from_db,
     load_availability,
     load_profiles,
+    load_profile_preferences,
     load_watchlist_context,
     identity_review_queue,
     load_rating_history_from_db,
@@ -81,6 +84,7 @@ from movie_database import (
     save_curated_week,
     save_availability,
     save_profile,
+    save_profile_preference,
     save_watchlist_context,
     set_identity_status,
     set_content_type,
@@ -513,6 +517,20 @@ mode = "outside_watchlist" if mode_label == "Not on my watchlist" else "watchlis
 filter_values_preview = available_filter_values(pd.DataFrame())
 taste_mode = st.sidebar.selectbox("Taste mode", filter_values_preview.get("taste_modes", ["Balanced"]), index=0)
 
+if not profiles.empty:
+    profile_labels = {f"{row['name']} ({row['profile_id']})": row["profile_id"] for _, row in profiles.iterrows()}
+    default_profile_labels = [
+        label for label, pid in profile_labels.items()
+        if bool(profiles.loc[profiles["profile_id"] == pid, "is_primary"].iloc[0])
+    ] or [next(iter(profile_labels))]
+    selected_profile_labels = st.sidebar.multiselect(
+        "Taste profiles", list(profile_labels), default=default_profile_labels,
+        help="Select multiple profiles for a blended recommendation. Strong dislikes act as vetoes.",
+    )
+    selected_profile_ids = [profile_labels[label] for label in selected_profile_labels] or ["me"]
+else:
+    selected_profile_ids = ["me"]
+
 with st.sidebar.expander("Advanced scoring weights"):
     st.caption("Drag to change how much each signal pulls the final score.")
     content_weight = st.slider("Taste similarity", 0.0, 3.0, 1.0, 0.25, help="How strongly TF-IDF content similarity to your high-rated films affects the score.")
@@ -521,7 +539,8 @@ with st.sidebar.expander("Advanced scoring weights"):
     list_weight = st.slider("List signals", 0.0, 3.0, 1.0, 0.25, help="How much being on your curated lists counts.")
     anchor_weight = st.slider("Anchor influence", 0.0, 3.0, 1.0, 0.25, help="How strongly the film you anchor on (Recommendations page) pulls thematically similar candidates up.")
     feedback_weight = st.slider("Watched-movie feedback", 0.0, 3.0, 1.0, 0.25, help="How strongly the taste labels you give watched films (Analysis → Tune watched movies) pull recommendations toward or away from similar films. Deliberate tuning already counts more than passive feedback.")
-score_weights = {"content": content_weight, "theme": theme_weight, "entity": entity_weight, "list": list_weight, "anchor": anchor_weight, "feedback": feedback_weight}
+    rewatch_weight = st.slider("Rewatch influence", 0.0, 3.0, 1.0, 0.25, help="Boost similarity to positively rated films you have reliably watched more than once.")
+score_weights = {"content": content_weight, "theme": theme_weight, "entity": entity_weight, "list": list_weight, "anchor": anchor_weight, "feedback": feedback_weight, "rewatch": rewatch_weight}
 
 st.sidebar.divider()
 _sync_brief = sync_status()
@@ -530,7 +549,7 @@ st.sidebar.caption(
     f"Last sync: {_sync_brief.get('last_sync_at', 'never')}"
 )
 
-recs, decade_prefs = build_recommendations(data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode, score_weights=score_weights)
+recs, decade_prefs = build_recommendations(data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode, score_weights=score_weights, profile_ids=selected_profile_ids)
 
 
 def attach_availability(frame: pd.DataFrame) -> pd.DataFrame:
@@ -556,13 +575,52 @@ col5.metric("Metadata coverage", f"{known_count}/{len(all_movies)}")
 
 
 def store_feedback(movie_id: str, feedback_value: str, scope: str = "recommendation") -> None:
+    if not recs.empty:
+        st.session_state["feedback_impact_before"] = recs[["movie_id", "Name", "score"]].copy()
+        st.session_state["feedback_impact_source"] = movie_id
+        st.session_state["feedback_impact_label"] = feedback_value
     if use_database:
         save_feedback_to_db(movie_id, feedback_value, scope=scope, db_path=db_path)
     else:
         save_feedback(movie_id, feedback_value, scope=scope)
 
 
+def render_feedback_impact() -> None:
+    before = st.session_state.get("feedback_impact_before")
+    if before is None or recs.empty:
+        return
+    impact = recommendation_impact(before, recs)
+    label = st.session_state.get("feedback_impact_label", "feedback")
+    source = st.session_state.get("feedback_impact_source", "")
+    with st.expander("How your last feedback changed recommendations", expanded=True):
+        st.caption(f"Feedback: {FEEDBACK_LABELS.get(label, {}).get('description', label)} · {source}")
+        changed = impact[impact["score_change"].abs() > 1e-9] if not impact.empty else impact
+        if changed.empty:
+            st.write("No visible score changes in the current candidate pool.")
+        else:
+            view = changed.copy()
+            view["score_change"] = view["score_change"].map(lambda value: f"{value:+.2f}")
+            view["rank_change"] = view["rank_change"].map(lambda value: f"{int(value):+d}")
+            st.dataframe(
+                view[["Name", "score_change", "rank_before", "rank_after", "rank_change"]],
+                hide_index=True, use_container_width=True,
+                column_config={
+                    "Name": "Title", "score_change": "Score Δ", "rank_before": "Before",
+                    "rank_after": "After", "rank_change": "Rank Δ",
+                },
+            )
+        if st.button("Dismiss impact", key="dismiss_feedback_impact"):
+            st.session_state.pop("feedback_impact_before", None)
+            st.session_state.pop("feedback_impact_source", None)
+            st.session_state.pop("feedback_impact_label", None)
+            st.rerun()
+
+
 def remove_feedback(movie_id: str, labels: list) -> None:
+    if not recs.empty and labels:
+        st.session_state["feedback_impact_before"] = recs[["movie_id", "Name", "score"]].copy()
+        st.session_state["feedback_impact_source"] = movie_id
+        st.session_state["feedback_impact_label"] = f"removed: {', '.join(labels)}"
     if use_database:
         remove_feedback_from_db(movie_id, labels, db_path=db_path)
     else:
@@ -749,6 +807,10 @@ def _component_explanations(row: pd.Series, taste_mode: str = "Balanced") -> dic
     elif float(row.get("content_score", 0) or 0) < 0:
         text["Taste similarity"] = "Similar to films you rated poorly."
 
+    joint_count = int(row.get("joint_profile_count", 1) or 0)
+    if joint_count > 1:
+        text["Joint profile fit"] = f"Blends {joint_count} profiles using 70% average fit and 30% least-satisfied-profile fit."
+
     theme_score = float(row.get("theme_score", 0) or 0)
     if abs(theme_score) > 0.01:
         text["Theme similarity"] = (
@@ -766,7 +828,11 @@ def _component_explanations(row: pd.Series, taste_mode: str = "Balanced") -> dic
         )
 
     if float(row.get("taste_mode_score", 0) or 0) > 0:
-        text["Taste mode"] = f"Fits the selected taste mode: {taste_mode}."
+        matches = str(row.get("taste_mode_matches", "") or "")
+        text["Taste mode"] = f"Fits {taste_mode}: {matches}." if matches else f"Fits the selected taste mode: {taste_mode}."
+
+    if float(row.get("rewatch_score", 0) or 0) > 0.01:
+        text["Rewatch affinity"] = "Similar to positively rated films with reliable repeat-viewing evidence."
 
     entity_score = float(row.get("entity_score", 0) or 0)
     if abs(entity_score) > 0.01:
@@ -791,6 +857,8 @@ def render_score_breakdown(row: pd.Series, score_weights: dict, anchor_active: b
     entity_w = float(score_weights.get("entity", 1.0))
     list_w = float(score_weights.get("list", 1.0))
     anchor_w = float(score_weights.get("anchor", 1.0))
+    feedback_w = float(score_weights.get("feedback", 1.0))
+    rewatch_w = float(score_weights.get("rewatch", 1.0))
     # Mirror build_recommendations' anchor-focus attenuation so the chart stays honest.
     if anchor_active:
         content_w *= ANCHOR_FOCUS_SCALE
@@ -799,14 +867,18 @@ def render_score_breakdown(row: pd.Series, score_weights: dict, anchor_active: b
 
     list_contrib = float(row.get("list_contribution", 0) or 0)
     heuristic = float(row.get("heuristic_score", 3.0) or 3.0)
-    base_delta = heuristic - list_contrib - 3.0  # decade + recency above the 3.0 baseline
+    base_delta = (heuristic - list_contrib - 3.0) * HEURISTIC_WEIGHT
 
     components = [
         ("Decade & recency", base_delta),
         ("List signals", list_contrib * list_w),
-        ("Taste similarity", float(row.get("content_score", 0) or 0) * content_w),
+        (
+            "Joint profile fit" if int(row.get("joint_profile_count", 1) or 0) > 1 else "Taste similarity",
+            float(row.get("joint_profile_score", row.get("content_score", 0)) or 0) * content_w,
+        ),
         ("Theme similarity", float(row.get("theme_score", 0) or 0) * theme_w),
-        ("Feedback", float(row.get("feedback_score", 0) or 0)),
+        ("Feedback", float(row.get("feedback_score", 0) or 0) * feedback_w),
+        ("Rewatch affinity", float(row.get("rewatch_score", 0) or 0) * rewatch_w),
         ("Taste mode", float(row.get("taste_mode_score", 0) or 0)),
         ("Dir / Cast affinity", float(row.get("entity_score", 0) or 0) * entity_w),
         ("Anchor match", float(row.get("anchor_score", 0) or 0) * anchor_w),
@@ -1186,6 +1258,7 @@ def render_analysis_page(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame, 
 
 if page == "Tonight's Pick":
     st.subheader("What should I watch tonight?")
+    render_feedback_impact()
     st.caption("One pick, committed. Adjust until it clicks — then hit 'This is perfect!'")
 
     tp1, tp2 = st.columns(2)
@@ -1226,6 +1299,7 @@ if page == "Tonight's Pick":
         taste_mode=tonight_taste,
         score_weights=score_weights,
         avoid_moods=tonight_avoid or [],
+        profile_ids=selected_profile_ids,
     )
     tonight_recs = attach_availability(tonight_recs)
 
@@ -1310,6 +1384,7 @@ if page == "Tonight's Pick":
 
 elif page == "Recommendations":
     st.subheader("Recommended next watches" if mode == "watchlist" else "Recommended outside your watchlist")
+    render_feedback_impact()
     if metadata.empty:
         st.info("TMDb cache is empty. The app is using the original list/decade ranking until you fetch metadata.")
     else:
@@ -1355,6 +1430,7 @@ elif page == "Recommendations":
             data, metadata=metadata, mode=mode, feedback=feedback, taste_mode=taste_mode,
             score_weights=score_weights, anchor_movie_id=anchor_movie_id, avoid_moods=avoid_moods,
             anchor_focus=anchor_focus,
+            profile_ids=selected_profile_ids,
         )
 
     filter_values = available_filter_values(recs)
@@ -1400,7 +1476,7 @@ elif page == "Recommendations":
                     with col:
                         poster_card(top.iloc[idx], idx)
     else:
-        show_cols = ["Name", "Year", "score", "heuristic_score", "content_score", "theme_score", "feedback_score", "taste_mode_score", "entity_score", "anchor_score", "mood_penalty", "why", "Letterboxd URI"]
+        show_cols = ["Name", "Year", "score", "heuristic_score", "content_score", "joint_profile_score", "joint_profile_count", "theme_score", "feedback_score", "rewatch_score", "taste_mode_score", "taste_mode_matches", "entity_score", "anchor_score", "mood_penalty", "why", "Letterboxd URI"]
         show_cols += [c for c in ["genres", "moods", "runtime", "languages", "directors", "cast", "keywords", "tmdb_url", "discovered_from"] if c in filtered.columns]
         render_grid(filtered[show_cols].head(100))
 
@@ -1458,6 +1534,7 @@ elif page == "Recommendations":
         )
 
 elif page == "Analysis":
+    render_feedback_impact()
     render_analysis_page(data, metadata, feedback)
 
 elif page == "Evaluation":
@@ -1874,6 +1951,36 @@ elif page == "Library":
             current_profiles = load_profiles(db_path)
             with p2:
                 st.dataframe(current_profiles[["profile_id", "name", "is_primary"]], hide_index=True, use_container_width=True)
+
+            st.markdown("#### Profile taste preferences")
+            st.caption("Joint picks use 70% average fit and 30% least-satisfied-profile fit. An explicit veto, or a rating of 1.5 or lower, excludes that title.")
+            if not movie_options.empty and not current_profiles.empty:
+                profile_choice_labels = {
+                    f"{row['name']} ({row['profile_id']})": row["profile_id"]
+                    for _, row in current_profiles.iterrows()
+                }
+                with st.form("profile_preference_form"):
+                    pref_title = st.selectbox("Film", option_labels, key="profile_pref_title")
+                    pp1, pp2 = st.columns(2)
+                    pref_profile = pp1.selectbox("Profile", list(profile_choice_labels))
+                    rating_choice = pp2.selectbox("Rating", ["Not rated"] + [x / 2 for x in range(1, 11)])
+                    pp3, pp4 = st.columns(2)
+                    liked = pp3.checkbox("Positive taste signal")
+                    veto = pp4.checkbox("Strong-dislike veto")
+                    pref_note = st.text_input("Preference note", placeholder="Why this worked — or did not")
+                    if st.form_submit_button("Save profile preference"):
+                        mid = str(movie_options.loc[movie_options["label"] == pref_title, "movie_id"].iloc[0])
+                        pid = profile_choice_labels[pref_profile]
+                        rating_value = None if rating_choice == "Not rated" else float(rating_choice)
+                        save_profile_preference(mid, pid, rating_value, liked, veto, pref_note, db_path=db_path)
+                        st.success("Profile preference saved.")
+                        st.rerun()
+            current_preferences = load_profile_preferences(db_path)
+            if not current_preferences.empty:
+                st.dataframe(
+                    current_preferences[["profile_name", "Name", "Year", "rating", "liked", "veto", "note"]],
+                    hide_index=True, use_container_width=True,
+                )
 
             watchlist_options = data["watchlist"].sort_values(["Name", "Year"]).copy()
             watchlist_options["label"] = watchlist_options.apply(lambda r: f"{r['Name']} ({fmt_year(r['Year'])})", axis=1)

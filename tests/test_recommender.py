@@ -11,10 +11,14 @@ from recommender import (
     _as_list,
     add_feedback_similarity,
     add_heuristic_scores,
+    add_joint_profile_score,
     apply_filters,
     build_recommendations,
     candidate_pool,
     normalize_movie_key,
+    recommendation_impact,
+    reliable_watch_counts,
+    taste_mode_evidence,
 )
 
 
@@ -25,6 +29,65 @@ def test_filters_media_type_and_availability():
     ])
     result = apply_filters(recs, content_types=["film"], available_ids=["film (2020)"])
     assert result["movie_id"].tolist() == ["film (2020)"]
+
+
+def test_reliable_watch_counts_ignore_unknown_dates_and_respect_rewatch_flag():
+    diary = pd.DataFrame([
+        {"movie_id": "a", "Date Kind": "exact", "Rewatch": True},
+        {"movie_id": "b", "Date Kind": "exact", "Rewatch": False},
+        {"movie_id": "b", "Date Kind": "exact", "Rewatch": True},
+        {"movie_id": "c", "Date Kind": "unknown", "Rewatch": True},
+    ])
+    assert reliable_watch_counts(diary) == {"a": 2, "b": 2}
+
+
+def test_taste_modes_are_strong_and_explainable():
+    row = pd.Series({
+        "genres": ["Comedy", "Romance"], "moods": ["Light"],
+        "keywords": ["feel-good"], "overview": "A warm evening together", "runtime": 95,
+    })
+    comfort_score, comfort_matches = taste_mode_evidence(row, "Comfort movie")
+    short_score, short_matches = taste_mode_evidence(row, "Short runtime")
+    assert comfort_score >= 2.0
+    assert "light" in comfort_matches
+    assert short_score == 2.0
+    assert "95 min" in short_matches
+
+
+def test_recommendation_impact_reports_score_and_rank_changes():
+    before = pd.DataFrame([
+        {"movie_id": "a", "Name": "A", "score": 2.0},
+        {"movie_id": "b", "Name": "B", "score": 1.0},
+    ])
+    after = pd.DataFrame([
+        {"movie_id": "b", "Name": "B", "score": 3.0},
+        {"movie_id": "a", "Name": "A", "score": 2.0},
+    ])
+    impact = recommendation_impact(before, after)
+    b = impact.set_index("movie_id").loc["b"]
+    assert b["score_change"] == 2.0
+    assert b["rank_change"] == 1
+
+
+def test_joint_profile_blend_protects_minimum_and_marks_veto():
+    candidates = normalize_movie_key(pd.DataFrame([
+        {"Name": "My Match", "Year": 2020, "content_score": 4.0},
+        {"Name": "Partner Match", "Year": 2021, "content_score": 0.0},
+    ]))
+    metadata = pd.DataFrame([
+        {"Name": "Partner Favorite", "Year": 2010, "genres": ["Comedy"], "directors": [], "writers": [], "cast": [], "keywords": ["wedding"], "overview": "A wedding comedy"},
+        {"Name": "My Match", "Year": 2020, "genres": ["Horror"], "directors": [], "writers": [], "cast": [], "keywords": ["haunting"], "overview": "A haunted house"},
+        {"Name": "Partner Match", "Year": 2021, "genres": ["Comedy"], "directors": [], "writers": [], "cast": [], "keywords": ["wedding"], "overview": "A wedding comedy"},
+    ])
+    preferences = pd.DataFrame([
+        {"movie_id": "partner favorite (2010)", "profile_id": "partner", "rating": 5.0, "liked": 1, "veto": 0},
+        {"movie_id": "my match (2020)", "profile_id": "partner", "rating": 1.0, "liked": 0, "veto": 1},
+    ])
+    result = add_joint_profile_score(candidates, metadata, preferences, ["me", "partner"])
+    rows = result.set_index("Name")
+    assert rows.loc["My Match", "profile_veto"]
+    assert rows.loc["Partner Match", "joint_profile_count"] == 2
+    assert 0 < rows.loc["Partner Match", "joint_profile_score"] < 4.0
 
 
 def _metadata_data() -> tuple[dict, pd.DataFrame]:
@@ -338,6 +401,21 @@ def test_content_match_outranks_recent_only_film():
     recs, _ = build_recommendations(data, metadata=metadata)
     scores = recs.set_index("Name")["score"]
     assert scores["Twin Film"] > scores["Fresh Film"]
+
+
+def test_rewatch_history_adds_bounded_affinity_signal():
+    data, metadata = _metadata_data()
+    no_history, _ = build_recommendations(data, metadata=metadata)
+    data["diary"] = pd.DataFrame([
+        {"movie_id": "liked film (2005)", "Date Kind": "exact", "Rewatch": False},
+        {"movie_id": "liked film (2005)", "Date Kind": "exact", "Rewatch": True},
+    ])
+    with_history, _ = build_recommendations(data, metadata=metadata)
+    old = no_history.set_index("Name").loc["Twin Film"]
+    new = with_history.set_index("Name").loc["Twin Film"]
+    assert old["rewatch_score"] == 0.0
+    assert 0.0 < new["rewatch_score"] <= 1.25
+    assert new["score"] > old["score"]
 
 
 # --- anchor weighting (#4) ---

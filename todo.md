@@ -1,44 +1,26 @@
-# TODO: Watched-Movie Feedback Tuning
+# Watched-Movie Feedback Tuning
 
-## Goal
-Use already-watched movies as explicit taste signals for the recommender, especially for the “More or Less like this” evaluation flow.
+Status verified on 2026-09-16. The original feature is complete; remaining work has moved into the broader personal-taste goal.
 
-## Tasks
+## Completed
 
-### 1. Add richer feedback constants in `recommender.py`
-- Define a shared feedback label map, for example:
-  - `more_like_this`
-  - `less_like_this`
-  - `rewatchable`
-  - `one_and_done`
-  - `interesting_but_not_more`
-  - `high_quality_not_my_taste`
-  - `guilty_pleasure`
-- Keep the existing `more_like_this` / `less_like_this` labels compatible with current saved feedback.
+- Rich feedback labels, including positive, neutral and negative taste distinctions.
+- Backwards compatibility with `more_like_this` and `less_like_this`.
+- Stronger weighting for deliberate watched-movie tuning.
+- Searchable/filterable Tune Watched Movies interface.
+- Feedback scope and free-text taste notes.
+- Similarity-based propagation from tagged films into recommendation scores.
 
-### 2. Update the feedback weight map in `add_feedback_similarity`
-- Replace the current hardcoded two-label weights with the richer feedback constants.
-- Make explicit watched-movie feedback stronger than passive ratings/likes.
-- Preserve negative weighting for “less like this” style labels.
-- Ensure direct feedback on a recommendation still adjusts that item directly.
+## Remaining extensions
 
-### 3. Add a “Tune watched movies” UI block in `app.py`
-- Add a section for watched/rated movies, likely on the Analysis page or sidebar.
-- Show movie title, year, rating, metadata summary, and current feedback labels if present.
-- Add buttons/selectbox for richer labels.
-- Save selections through the existing feedback flow or `save_feedback_to_db`.
-- Let users search/filter watched movies so the section does not become overwhelming.
+- Import Letterboxd review text for analysis and optional LLM context.
 
-### 4. Optional later: add `feedback_scope` or `note`
-- Consider adding a `feedback_scope` column to distinguish:
-  - recommendation feedback
-  - watched-movie tuning feedback
-  - evaluation feedback
-- Consider adding a free-text `note` column for taste explanations.
-- Not required for the initial implementation; the current generic `feedback` table can support the first version.
+## Added on 2026-09-16
 
-## Acceptance Criteria
-- Watched movies can be marked with richer taste labels.
-- Recommendation scoring changes based on those labels.
-- Existing `more_like_this` and `less_like_this` feedback still works.
-- The app no longer treats all high ratings as automatically meaning “more like this.”
+- Reliable diary counts and explicit rewatch flags feed a bounded rewatch-affinity score.
+- Bulk Letterboxd “marked watched” events remain excluded from count-based taste scoring.
+- Taste modes use stronger positive/negative evidence and expose their matched evidence.
+- Feedback changes display before/after score and rank movement.
+- Per-profile ratings, positive signals and vetoes feed a blended joint score.
+
+See `feedback-status.md` for the canonical prioritized roadmap.

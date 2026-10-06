@@ -1,3 +1,15 @@
+# Architecture Roadmap
+
+Status reviewed on 2026-09-16. This document describes optional structural evolution; `feedback-status.md` is the canonical product roadmap.
+
+Current assessment:
+
+- SQLite and Streamlit remain appropriate for this personal, single-user application.
+- Pytest coverage and fixture databases are in place; ranking ground-truth coverage remains open.
+- Database rebuilds preserve personal records, but versioned migrations and backups around every mutating workflow remain open.
+- LLM-assisted curation is implemented and remains additive; deterministic ranking is still authoritative.
+- FastAPI, PostgreSQL and pgvector remain conditional future work, not current requirements.
+
 Your current stack is a good MVP stack. I would not replace SQLite or Streamlit yet—your catalogue is only a few thousand titles, and the recommender logic is already sensibly centred on explainable TF‑IDF/content scoring, Letterboxd signals, feedback, and offline evaluation.
 
 The highest-value additions are:
@@ -42,10 +54,11 @@ A few things I would deliberately avoid for now:
 - An LLM orchestration framework as the recommender itself. An LLM can make the interface conversational and generate explanations, but should not replace deterministic ranking and evaluation.
 - Moving to Postgres just because it is “production-grade.” SQLite remains a strong fit for a personal, single-user app.
 
-My suggested build order:
+Updated suggested build order:
 
-1. SQLAlchemy + Alembic, Pydantic settings, and automated tests.
-2. Make imports/enrichment repeatable and observable; add backups.
-3. Add semantic embeddings alongside TF‑IDF and compare them on your existing evaluation page.
-4. Add FastAPI only once the Streamlit UI no longer represents the only client.
-5. Move to Postgres—with `pgvector` if embeddings prove useful—when you introduce user accounts, shared use, or a deployed service.
+1. Add ranking ground truth and complete the personal-taste signal work.
+2. Introduce versioned migrations and typed validation without rewriting the working SQLite layer wholesale.
+3. Move import, enrichment and recommendation orchestration into services; add structured logs and automatic backups.
+4. Add semantic embeddings alongside TF‑IDF only after they can be compared against the ground-truth set.
+5. Add FastAPI only once the Streamlit UI no longer represents the only client.
+6. Move to Postgres—with `pgvector` if embeddings prove useful—when you introduce accounts, shared use or a deployed service.

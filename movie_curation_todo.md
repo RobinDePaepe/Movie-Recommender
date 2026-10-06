@@ -1,199 +1,46 @@
-# TODO: Movie Curation Feature
+# Curated Weeks Status
 
-## Goal
-Add a “Curated Weeks” feature that builds an ordered watchlist around one anchor movie.
+Status verified on 2026-09-16.
 
----
+## Completed
 
-## 1. Add curator module
-- Add `curator.py` to the project root.
-- Use `build_curated_list()` to generate curated movie lists.
-- Support custom list length with `total_movies`, defaulting to 7.
+- Ordered movie weeks around an anchor film.
+- Configurable length, style and candidate-pool controls.
+- Roles, explanations, posters, genres, moods and flow visualization.
+- Theme-aware deterministic curation.
+- LLM-assisted Filmweek curation with multiple providers.
+- TMDb verification of factual title/year/director information.
+- Save and reopen weeks.
+- Regenerate an individual LLM-curated slot.
 
-### Core functionality
-- Accept:
-  - anchor movie
-  - metadata
-  - Letterboxd data
-  - style
-  - total movie count
-- Generate ordered movie sequences.
-- Assign roles to movies:
-  - context
-  - thematic setup
-  - anchor
-  - director connection
-  - intensifier
-  - contrast
-  - afterglow
+## Open improvements
 
----
+### Interaction
 
-## 2. Add Streamlit page
-- In `app.py`, add `"Curated Weeks"` to the sidebar page selector.
+- Pin a slot while regenerating the rest.
+- Remove and refill deterministic-curator slots.
+- Drag-and-drop ordering.
+- Track watched/completed slots and favorite weeks.
 
-### Import curator functions
-```python
-from curator import (
-    build_curated_list,
-    anchor_options,
-    CURATION_STYLES,
-)
-```
+### Sequence quality
 
-### Add page block
-```python
-elif page == "Curated Weeks":
-    st.subheader("Curated movie week")
-```
+- Avoid emotionally heavy films back-to-back.
+- Add explicit pacing intelligence.
+- Penalize repetitive directors, actors and franchises across a week.
+- Improve contrast and afterglow selection.
 
----
+### Additional modes
 
-## 3. Add curator controls
+- Double feature, film school, comfort week and late-night.
+- Actor deep dive and director evolution.
+- Criterion-core, festival and movie-club modes.
 
-### Anchor movie selector
-- Select from:
-  - watched movies
-  - rated movies
-  - watchlist movies
+### Presentation and sharing
 
-### Movie count slider
-```python
-total_movies = st.slider(
-    "Number of movies",
-    3,
-    14,
-    7
-)
-```
+- CSV and Markdown exports dedicated to Curated Weeks.
+- Mood, decade and genre-balance summaries.
+- Printable card or shareable JSON.
+- Letterboxd-compatible export if a stable import format is available.
+- Public/friend collaboration only if the project becomes multi-user.
 
-### Style selector
-Use:
-```python
-CURATION_STYLES
-```
-
-Initial styles:
-- Balanced
-- Director-focused
-- Theme-focused
-- Vibe-focused
-- Cinephile / historical context
-- Gentler pacing
-
-### Add checkboxes
-- Allow watched movies
-- Allow watchlisted movies
-- Include anchor movie in final list
-
----
-
-## 4. Render curated result
-
-### Display format
-Each item should show:
-- Day / order number
-- Role
-- Movie title
-- Year
-- Why it was chosen
-- Poster
-- Genres / moods
-
-### Nice-to-have
-- Timeline / flow visualization
-- “Intensity curve” across the week
-- Group by emotional pacing
-
----
-
-## 5. Add export functionality
-
-### CSV export
-Add:
-```python
-st.download_button(...)
-```
-
-### Future export ideas
-- Markdown export
-- Shareable JSON
-- Letterboxd import format
-- Printable “movie week card”
-
----
-
-## 6. Optional database support
-
-### Add tables
-```sql
-CREATE TABLE curated_weeks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    anchor_movie_id TEXT,
-    title TEXT,
-    style TEXT,
-    total_movies INTEGER,
-    created_at TEXT
-);
-
-CREATE TABLE curated_week_items (
-    week_id INTEGER,
-    day_number INTEGER,
-    movie_id TEXT,
-    role TEXT,
-    reason TEXT
-);
-```
-
-### Future capabilities
-- Save curated weeks
-- Re-open previous weeks
-- Favorite curated weeks
-- Compare styles
-- Track completion progress
-
----
-
-## 7. Future improvements
-
-### Recommendation quality
-- Avoid emotionally heavy movies back-to-back
-- Add pacing intelligence
-- Detect duplicate directors / actors overload
-- Improve contrast selection
-
-### User interaction
-- Regenerate one slot
-- Pin movies manually
-- Remove movie and refill automatically
-- Drag-and-drop ordering
-
-### Advanced curation modes
-- “Film school”
-- “Double feature”
-- “Late-night”
-- “Comfort week”
-- “Criterion-core”
-- “Actor deep dive”
-- “Director evolution”
-
-### LLM enhancements
-- Generate natural-language explanations
-- Create intro paragraph for the week
-- Generate “why this order works”
-- Generate discussion questions
-
-### Visualization ideas
-- Mood graph
-- Decade distribution
-- Genre balance
-- Director network graph
-- Influence chain visualization
-
-### Long-term ideas
-- Public curated week sharing
-- Friend collaboration)
-- Voting on curation variants
-- AI-generated festival programming
-- Seasonal curation events
-- “Movie club mode”
+See `feedback-status.md` for overall project priority.
