@@ -13,7 +13,7 @@
 - `src/movie_recommender/integrations/` — TMDb, OMDb, and LLM provider clients.
 - `scripts/` — command-line utilities for database setup, metadata enrichment, and Letterboxd sync.
 - `tests/` — automated tests, organized by feature.
-- `docs/` — design notes, plans, and historical project documentation.
+- `docs/` — current architecture and open-work documentation; `archive/` preserves superseded plans and status reports.
 
 The project uses a `src/` package layout. Install it in editable mode before running the app or tests so imports resolve consistently.
 

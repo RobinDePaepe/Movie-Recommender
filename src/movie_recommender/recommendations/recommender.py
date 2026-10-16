@@ -20,7 +20,8 @@ LIST_COUNT_WEIGHT = 0.1
 # Being in many curated lists ("Top 250", "canon", "masterworks"...) shouldn't let list
 # membership alone outscore genuine content/theme similarity — cap the raw stacked score
 # before scaling so it stays a boost/tie-breaker rather than the dominant signal. See the
-# 2026-07-10 ground-truth ranking exercise in testing-feedback.md: several 4-5★ films with
+# 2026-07-10 ground-truth ranking exercise in archive/testing-feedback-2026-10-16.md:
+# several 4-5★ films with
 # negative content+theme scores still ranked in the top 5% purely on stacked list signal.
 LIST_SCORE_CAP = 6.0
 # The heuristic (decade/recency/liked) is a tie-breaker, not the dominant signal:

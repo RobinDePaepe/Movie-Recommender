@@ -101,6 +101,8 @@ pytest tests/test_recommender.py::test_build_recommendations_no_metadata_returns
 
 See `AGENT.md` for repository-specific development commands, architecture details, and data-handling guidance. `CLAUDE.md` contains the corresponding Claude Code notes.
 
+The current architecture target is the [RAG design](docs/rag-architecture.md), based on [RAG architecture.png](docs/RAG%20architecture.png). Track active implementation work in [docs/open-work.md](docs/open-work.md); superseded plans and status reports are preserved in `archive/`.
+
 ## Local data and privacy
 
 The app stores its SQLite database, Letterboxd exports, TMDb cache, theme embeddings, feedback, and sync overlays under `data/`. These files are ignored by Git. Keep API keys in environment variables or `.env`; never add personal exports or credentials to commits.
