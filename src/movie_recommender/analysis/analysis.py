@@ -10,8 +10,8 @@ from typing import Dict, Tuple
 
 import pandas as pd
 
-from recommender import FEEDBACK_LABELS, compute_entity_affinity
-from reflection import REFLECTION_CATEGORIES
+from movie_recommender.recommendations.recommender import FEEDBACK_LABELS, compute_entity_affinity
+from movie_recommender.analysis.reflection import REFLECTION_CATEGORIES
 
 
 def ratings_over_time(ratings: pd.DataFrame, diary: pd.DataFrame) -> pd.DataFrame:

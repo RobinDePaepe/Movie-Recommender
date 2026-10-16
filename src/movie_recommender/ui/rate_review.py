@@ -13,8 +13,8 @@ import streamlit as st
 from streamlit_extras.star_rating import star_rating
 from streamlit_extras.stylable_container import stylable_container
 
-from movie_database import import_tmdb_cache, load_latest_reflection, save_reflection, save_watch_context
-from reflection import REFLECTION_CATEGORIES, build_facets, resolve_for_reflection, suggested_overall_rating
+from movie_recommender.data.movie_database import import_tmdb_cache, load_latest_reflection, save_reflection, save_watch_context
+from movie_recommender.analysis.reflection import REFLECTION_CATEGORIES, build_facets, resolve_for_reflection, suggested_overall_rating
 
 
 def _history_table(history) -> pd.DataFrame:

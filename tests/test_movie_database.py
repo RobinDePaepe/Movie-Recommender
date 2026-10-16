@@ -4,7 +4,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-import movie_database as mdb
+from movie_recommender.data import movie_database as mdb
 
 
 @pytest.fixture()

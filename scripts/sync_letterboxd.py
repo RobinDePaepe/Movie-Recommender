@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from letterboxd_sync import sync_rss, sync_status
+from movie_recommender.data.letterboxd_sync import sync_rss, sync_status
 
 
 def main() -> None:

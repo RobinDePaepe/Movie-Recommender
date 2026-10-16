@@ -11,9 +11,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-import theme_similarity
-from movie_database import movie_id as build_movie_id
-from recommender import _as_list, prepare_metadata
+from movie_recommender.recommendations import theme_similarity
+from movie_recommender.data.movie_database import movie_id as build_movie_id
+from movie_recommender.recommendations.recommender import _as_list, prepare_metadata
 
 REFLECTION_CATEGORIES = [
     "Story & Writing",

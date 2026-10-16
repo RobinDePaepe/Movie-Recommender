@@ -238,7 +238,7 @@ def sync_status(sync_dir: str | Path = SYNC_DIR) -> Dict[str, Any]:
 
 
 def apply_sync_overlays(data: Dict[str, pd.DataFrame], sync_dir: str | Path = SYNC_DIR) -> Dict[str, pd.DataFrame]:
-    from recommender import normalize_movie_key
+    from movie_recommender.recommendations.recommender import normalize_movie_key
 
     sync_dir = Path(sync_dir)
     out = {k: v.copy() for k, v in data.items()}

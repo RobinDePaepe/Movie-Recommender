@@ -8,6 +8,7 @@ pytest
 streamlit-option-menu
 streamlit-extras
 streamlit-aggrid
+python-dotenv
 
 # Filmweek (AI discovery) LLM backends. anthropic is the default; the others are
 # optional and only imported when you select that provider in the UI.

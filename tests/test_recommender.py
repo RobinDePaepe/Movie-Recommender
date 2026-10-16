@@ -6,7 +6,7 @@ import pytest
 
 import datetime
 
-from recommender import (
+from movie_recommender.recommendations.recommender import (
     FEEDBACK_LABELS,
     _as_list,
     add_feedback_similarity,
@@ -275,7 +275,7 @@ def test_outside_watchlist_excludes_non_discovered_cache():
 def test_add_feedback_similarity_empty_feedback_returns_zero():
     data = _minimal_data()
     pool = candidate_pool(data)
-    from recommender import add_heuristic_scores, add_content_similarity
+    from movie_recommender.recommendations.recommender import add_heuristic_scores, add_content_similarity
     pool, _ = add_heuristic_scores(pool, data)
     pool, _ = add_content_similarity(pool, data["ratings"], data["likes"], pd.DataFrame())
     result = add_feedback_similarity(pool, pd.DataFrame(), None)
@@ -371,7 +371,7 @@ def test_decade_score_is_shrunk_toward_mean():
 # --- list-score cap: stacked list membership can't dwarf taste signals ---
 
 def test_list_contribution_is_capped_for_stacked_lists():
-    from recommender import LIST_SCORE_CAP, LIST_SCORE_SCALE, LIST_COUNT_WEIGHT
+    from movie_recommender.recommendations.recommender import LIST_SCORE_CAP, LIST_SCORE_SCALE, LIST_COUNT_WEIGHT
 
     candidates = normalize_movie_key(pd.DataFrame([{"Name": "Stacked Film", "Year": 2010}]))
     # Six "prestige" lists all matching the same list_weight() rule (1.5 each = 9.0 raw),
@@ -512,8 +512,8 @@ def test_anchor_focus_rescues_concept_cousin():
 
 
 def test_theme_similarity_helpers_finite_without_embedding_lib():
-    import theme_similarity
-    from recommender import prepare_metadata, candidate_pool
+    from movie_recommender.recommendations import theme_similarity
+    from movie_recommender.recommendations.recommender import prepare_metadata, candidate_pool
     data, metadata = _theme_data()
     meta = prepare_metadata(metadata)
     cands = candidate_pool(data, mode="watchlist")

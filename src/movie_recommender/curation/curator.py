@@ -10,8 +10,8 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from recommender import prepare_metadata
-import theme_similarity
+from movie_recommender.recommendations.recommender import prepare_metadata
+from movie_recommender.recommendations import theme_similarity
 
 
 DEFAULT_WEEK_SIZE = 7

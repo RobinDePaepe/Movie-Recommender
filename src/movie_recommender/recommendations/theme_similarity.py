@@ -39,7 +39,7 @@ _model_loaded = False
 def _as_list(value) -> List[str]:
     # Lazy import keeps this module free of a top-level recommender dependency
     # (recommender imports theme_similarity at module load).
-    from recommender import _as_list as _al
+    from movie_recommender.recommendations.recommender import _as_list as _al
     return _al(value)
 
 
@@ -260,7 +260,7 @@ def theme_taste_scores(candidates: pd.DataFrame, ratings: pd.DataFrame, likes: p
         **{str(mid): text_by_id[str(mid)] for mid in neg_ids},
     })
 
-    from recommender import _rating_weight
+    from movie_recommender.recommendations.recommender import _rating_weight
     rating_lookup = rated.dropna(subset=["Rating"]).set_index("movie_id")["Rating"] if not rated.empty else pd.Series(dtype=float)
     pos_weights = np.array([
         _rating_weight(rating_lookup[mid]) if mid in getattr(rating_lookup, "index", []) else _rating_weight(4.0)

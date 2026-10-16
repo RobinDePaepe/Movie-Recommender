@@ -7,9 +7,9 @@ from dotenv import load_dotenv
 import pandas as pd
 
 
-from recommender import ensure_export_dir, load_letterboxd, prepare_metadata
-from letterboxd_sync import apply_sync_overlays
-from tmdb_client import TMDbClient, discover_movies_from_favorites, enrich_movies, metadata_from_cache
+from movie_recommender.recommendations.recommender import ensure_export_dir, load_letterboxd, prepare_metadata
+from movie_recommender.data.letterboxd_sync import apply_sync_overlays
+from movie_recommender.integrations.tmdb_client import TMDbClient, discover_movies_from_favorites, enrich_movies, metadata_from_cache
 
 load_dotenv()  # Add this
 

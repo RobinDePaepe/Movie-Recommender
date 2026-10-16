@@ -12,7 +12,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import mean_absolute_error
 from sklearn.metrics.pairwise import cosine_similarity
 
-import theme_similarity
+from movie_recommender.recommendations import theme_similarity
 
 FEEDBACK_PATH = Path("data/feedback.csv")
 LIST_SCORE_SCALE = 0.25
@@ -121,7 +121,8 @@ def normalize_movie_key(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["Name"] = out["Name"].astype(str).str.strip()
     out["Year"] = pd.to_numeric(out["Year"], errors="coerce").astype("Int64")
-    out["movie_id"] = out["Name"].str.lower() + " (" + out["Year"].astype(str) + ")"
+    year_text = out["Year"].astype("string").fillna("<NA>")
+    out["movie_id"] = out["Name"].str.lower() + " (" + year_text + ")"
     return out
 
 

@@ -1,6 +1,6 @@
 import json
 
-import llm_curator
+from movie_recommender.curation import llm_curator
 
 
 def test_generate_filmweek_drops_duplicate_and_anchor_titles(monkeypatch):

@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-import llm_providers
+from movie_recommender.integrations import llm_providers
 
 logger = logging.getLogger(__name__)
 

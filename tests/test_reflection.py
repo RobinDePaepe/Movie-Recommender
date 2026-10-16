@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from movie_database import load_latest_reflection, save_reflection
-from reflection import REFLECTION_CATEGORIES, suggested_overall_rating
+from movie_recommender.data.movie_database import load_latest_reflection, save_reflection
+from movie_recommender.analysis.reflection import REFLECTION_CATEGORIES, suggested_overall_rating
 
 
 def test_suggested_overall_rating_equal_weights():
@@ -59,7 +59,7 @@ def test_save_and_load_reflection_round_trip(tmp_path: Path):
     assert loaded["overall"]["rating"] == 4.5
     assert loaded["overall"]["note"] == "A near-favorite."
 
-    import movie_database
+    from movie_recommender.data import movie_database
     with movie_database.connect(db_path) as conn:
         row = conn.execute(
             "SELECT rating, source FROM ratings WHERE movie_id=?", ("reflect test film (2020)",)
@@ -75,7 +75,7 @@ def test_save_reflection_updates_official_rating_and_logs_history(tmp_path: Path
     save_reflection("history film (2019)", "History Film", 2019, payload, overall_rating=3.0, db_path=db_path)
     save_reflection("history film (2019)", "History Film", 2019, payload, overall_rating=4.0, db_path=db_path)
 
-    import movie_database
+    from movie_recommender.data import movie_database
     with movie_database.connect(db_path) as conn:
         history_rows = conn.execute(
             "SELECT old_rating, new_rating, source FROM rating_history WHERE movie_id=?",

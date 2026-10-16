@@ -8,8 +8,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-import theme_similarity as ts
-from recommender import prepare_metadata
+from movie_recommender.recommendations import theme_similarity as ts
+from movie_recommender.recommendations.recommender import prepare_metadata
 
 
 def _meta() -> pd.DataFrame:

@@ -4,7 +4,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from curator import (
+from movie_recommender.curation.curator import (
     BASE_ROLES,
     _overlap,
     _role_sequence,

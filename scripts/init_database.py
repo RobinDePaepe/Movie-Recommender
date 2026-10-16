@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pprint import pprint
 
-from movie_database import DB_PATH, database_status, import_feedback_csv, import_letterboxd_export, import_tmdb_cache, init_db, rebuild_database
+from movie_recommender.data.movie_database import DB_PATH, database_status, import_feedback_csv, import_letterboxd_export, import_tmdb_cache, init_db, rebuild_database
 
 
 def main() -> None:

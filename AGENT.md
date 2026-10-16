@@ -1,80 +1,77 @@
 # Repository guidance for coding agents
 
-This file adapts the repository's `CLAUDE.md` guidance for coding agents working on this project. Keep both files aligned when changing shared commands, environment variables, or architecture.
+`AGENT.md` is the source of truth for repository commands, architecture, and development guidance. Keep this file current when the project changes. `CLAUDE.md` points Claude Code to this file and should not duplicate its contents.
 
-## Commands
+## Project layout
 
-**Run the app:**
+- `app.py` — thin Streamlit launcher.
+- `src/movie_recommender/ui/` — Streamlit app and reflection panel.
+- `src/movie_recommender/recommendations/` — candidate selection, scoring, feedback, and thematic similarity.
+- `src/movie_recommender/curation/` — role-based film-week curation and LLM-assisted discovery orchestration.
+- `src/movie_recommender/analysis/` — taste analysis and reflection logic.
+- `src/movie_recommender/data/` — SQLite database access, Letterboxd sync/import, and external rating retrieval.
+- `src/movie_recommender/integrations/` — TMDb, OMDb, and LLM provider clients.
+- `scripts/` — command-line utilities for database setup, metadata enrichment, and Letterboxd sync.
+- `tests/` — automated tests, organized by feature.
+- `docs/` — design notes, plans, and historical project documentation.
 
-```bash
-streamlit run app.py
-```
+The project uses a `src/` package layout. Install it in editable mode before running the app or tests so imports resolve consistently.
 
-**Install dependencies:**
+## Setup and commands
+
+Create and activate a virtual environment, then install the project and its dependencies:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # macOS / Linux
 # .venv\Scripts\Activate.ps1      # Windows PowerShell
-pip install -r requirements.txt
-pip install statsmodels            # optional: evaluation chart trendline
-pip install sentence-transformers  # optional: semantic theme similarity
+pip install -e .
 ```
 
-**Run tests:**
+Run the app:
+
+```bash
+streamlit run app.py
+```
+
+Run tests:
 
 ```bash
 pytest tests/
 pytest tests/test_recommender.py::test_build_recommendations_no_metadata_returns_results
 ```
 
-**Enrich TMDb metadata from the command line:**
+Run the command-line tools:
 
 ```bash
-python enrich_tmdb.py --limit 100
+python scripts/init_database.py --status
+python scripts/enrich_tmdb.py --limit 100
+python scripts/sync_letterboxd.py YOUR_LETTERBOXD_USERNAME --status
 ```
 
-**Sync Letterboxd RSS and inspect status:**
+Optional packages:
 
-```bash
-python sync_letterboxd.py YOUR_LETTERBOXD_USERNAME --status
-```
+- `sentence-transformers` enables semantic theme embeddings; without it, theme similarity uses the TF-IDF fallback.
+- `statsmodels` enables a trendline on the evaluation chart.
 
 ## Environment and local data
 
-The app reads `TMDB_API_KEY` and `LETTERBOXD_USERNAME` (or `LETTERBOXD_RSS_CLIENT_ID`, which may be a direct RSS feed URL) from the environment or a `.env` file. LLM provider keys are described in `.env.example` and are only needed for the provider in use.
+The app reads `TMDB_API_KEY` and `LETTERBOXD_USERNAME` (or `LETTERBOXD_RSS_CLIENT_ID`, which may be a direct RSS feed URL) from environment variables or a root `.env` file. LLM provider credentials and their variable names are listed in `.env.example`.
 
-Place the standard Letterboxd export ZIP at `data/letterboxd_export.zip`. Local data, exports, databases, caches, and sync overlays are ignored by Git. Do not commit credentials or personal Letterboxd data.
+Place the Letterboxd export at `data/letterboxd_export.zip`. The `data/` directory contains local exports, databases, caches, feedback, and sync overlays and is ignored by Git. Do not commit credentials or personal Letterboxd data.
 
-## Architecture
+## Application behavior and architecture
 
-The app is a single-page Streamlit UI (`app.py`) that delegates business logic to modules. It injects a custom dark-cinema theme (`inject_theme()`, `render_hero()`, `score_badge_html()`, `chips_html()`). Startup auto-sync runs once per session when `LETTERBOXD_USERNAME` or `LETTERBOXD_RSS_CLIENT_ID` is set and the last sync was more than an hour ago. It pulls RSS activity, applies overlays to SQLite when the database is active, and persists the username to `.env`. Streamlit theme defaults live in `.streamlit/config.toml`.
+The Streamlit UI lives in `src/movie_recommender/ui/app.py`. It coordinates the feature modules and starts an RSS sync at most once per session when Letterboxd credentials are configured and the last sync is over an hour old. In database mode, synced overlays are applied to SQLite. Streamlit theme defaults are in `.streamlit/config.toml`.
 
-### Recommendation pipeline (`recommender.py`)
+The recommendation pipeline in `recommendations/recommender.py` selects candidates, computes weighted scores, and builds explanations. Its main signals include:
 
-1. `candidate_pool()` selects watchlist or outside-watchlist candidates.
-2. `add_heuristic_scores()` scores decade affinity (Bayesian-shrunk toward the global mean via `DECADE_PRIOR_COUNT`), liked-decade bonus, recency (linear decay from `0.8` in the current year to `0` over a 15-year window), and list signals. `LIST_SCORE_SCALE` and `LIST_COUNT_WEIGHT` control list influence.
-3. `add_content_similarity()` calculates TF-IDF cosine similarity over `feature_text` (genres ×4, directors ×5, cast ×2, keywords ×3, and overview) against highly rated films. Low-rated films contribute a penalty.
-4. `add_feedback_similarity()` compares candidates with films tagged using `FEEDBACK_LABELS`.
-5. `add_entity_affinity()` calculates Bayesian-average ratings for director, writer, and cast entities.
-6. `add_anchor_similarity()` optionally boosts similarity to a user-selected anchor, using the theme engine and a scale of `4.0`.
-7. `add_theme_similarity()` adds a separate conceptual similarity score (`theme_score`) based on keywords and overview from highly rated films, excluding genre and credit features.
-8. `apply_mood_avoidance()` applies a session-only mood penalty.
-9. The final `score` is a weighted sum. Sidebar weights control content, theme, entity, list, and anchor signals. Heuristics are damped tie-breakers: only deviation from the `3.0` floor contributes, scaled by `HEURISTIC_WEIGHT`. Anchor-focus (on by default) scales content, theme, and entity weights by `ANCHOR_FOCUS_SCALE` while an anchor is active.
+1. Heuristic preferences for decade, recency, and Letterboxd list membership.
+2. Content similarity using genres, directors, cast, keywords, and overview.
+3. Feedback similarity and director, writer, and cast affinity.
+4. Optional anchor similarity and thematic similarity. Theme similarity uses keywords and overview, with local sentence-transformer embeddings when available and a TF-IDF fallback otherwise.
+5. Session-level mood avoidance.
 
-### Key modules
+The theme engine is shared by recommendations and film-week curation. The `curation/` package builds ordered programmes around an anchor film and can use configurable LLM providers for discovery. `data/movie_database.py` owns SQLite access and schema setup; `data/letterboxd_sync.py` stores incremental RSS activity under `data/sync/`. A fresh Letterboxd export remains the source for complete watchlist state and older rating edits.
 
-- `theme_similarity.py` — shared thematic similarity engine. `theme_text()` uses keywords and overview only. It uses local `all-MiniLM-L6-v2` sentence-transformer embeddings, cached in `data/theme_embeddings.pkl` and invalidated by SHA-1 text hashes. If the optional package is unavailable, it falls back to TF-IDF. Provides `theme_anchor_scores()` and `theme_taste_scores()`, both scaled to roughly 0–4.
-- `curator.py` — builds ordered, role-based curated weeks around an anchor. Narrative roles include context/influence, thematic setup, and the anchor. Styles such as Balanced, Director-focused, Theme-focused, and Vibe-focused adjust `STYLE_WEIGHTS`, including the thematic similarity contribution.
-- `llm_curator.py` / `llm_providers.py` — Filmweek picks generated through configurable LLM backends.
-- `movie_database.py` — SQLite backend at `data/movie_recommender.sqlite`. Schema is created by `init_db()`. The app prefers the database when it exists; rebuild it from the export and metadata cache after new imports. JSON list columns are stored as JSON strings and decoded on load. After `sync_rss()`, call `apply_rss_overlays_to_db()` in DB mode to upsert rating history and deduplicated diary events without a full rebuild.
-- `tmdb_client.py` — `TMDbClient` wraps TMDb. `enrich_movies()` fetches and caches metadata in `data/tmdb_cache.json`; `discover_movies_from_favorites()` finds outside-watchlist candidates using TMDb recommendations and similar-film endpoints.
-- `letterboxd_sync.py` — incremental RSS sync for recent diary and rating activity, stored as overlays under `data/sync/`. RSS is additive; the export remains the source of truth for watchlist state and older rating edits.
-- `analysis.py`, `reflection.py`, and `rate_review.py` — analysis shaping helpers and reflection workflows.
-- `app.py` — Streamlit UI and application orchestration.
-
-### Data flow and identity
-
-Letterboxd export → `load_letterboxd()` → optional RSS overlay → `candidate_pool()` → scoring → Streamlit display. In database mode, `load_data_from_db()` supplies the library in place of CSV loading.
-
-The shared `movie_id` join key is `"{name lower} ({year})"`. Preserve this format when changing imports, sync, or joins.
+The shared `movie_id` join key is `"{name lower} ({year})"`. Preserve its format when changing imports, sync, or joins.

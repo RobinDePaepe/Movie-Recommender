@@ -16,7 +16,7 @@ A local Streamlit app for exploring a Letterboxd film library, finding films to 
 ## Requirements
 
 - Python 3.9 or newer
-- Packages in `requirements.txt`
+- Python packages declared through `pyproject.toml` and `requirements.txt`
 - A Letterboxd export ZIP for your library
 - A TMDb API key for metadata enrichment
 
@@ -33,7 +33,7 @@ Optional packages and credentials:
 python -m venv .venv
 source .venv/bin/activate          # macOS / Linux
 # .venv\Scripts\Activate.ps1      # Windows PowerShell
-pip install -r requirements.txt
+pip install -e .
 ```
 
 Set credentials in your shell or create a `.env` file in the project root. At minimum, set the TMDb key:
@@ -58,26 +58,25 @@ The app loads its library from the SQLite database when one exists; otherwise it
 Use the sidebar to manage metadata enrichment, recommendation settings, discovery modes, and analysis. TMDb enrichment can also be run from the command line:
 
 ```bash
-python enrich_tmdb.py --limit 100
+python scripts/enrich_tmdb.py --limit 100
 ```
 
 To sync Letterboxd RSS manually and inspect sync status:
 
 ```bash
-python sync_letterboxd.py YOUR_LETTERBOXD_USERNAME --status
+python scripts/sync_letterboxd.py YOUR_LETTERBOXD_USERNAME --status
 ```
 
 ## Architecture
 
-- `app.py` — Streamlit application, navigation, UI rendering, and startup sync.
-- `recommender.py` — candidate selection, recommendation scoring, explanations, and feedback handling.
-- `theme_similarity.py` — thematic similarity shared by recommendations and curated programmes; uses sentence-transformer embeddings when installed and TF-IDF otherwise.
-- `curator.py` — role-based, ordered film-week curation around an anchor.
-- `llm_curator.py` and `llm_providers.py` — LLM-generated Filmweek discovery and provider integrations.
-- `movie_database.py` and `init_database.py` — SQLite schema, imports, data access, and database rebuilds.
-- `letterboxd_sync.py` — RSS parsing, incremental event storage, and overlay application.
-- `tmdb_client.py` and `omdb_client.py` — external metadata clients; `enrich_tmdb.py` provides a TMDb enrichment command.
-- `analysis.py`, `reflection.py`, and `rate_review.py` — analysis helpers and film reflection workflows.
+- `app.py` — thin Streamlit launcher for `src/movie_recommender/ui/app.py`.
+- `src/movie_recommender/recommendations/` — candidate selection, scoring, explanations, feedback, and thematic similarity. Theme similarity uses sentence-transformer embeddings when installed and TF-IDF otherwise.
+- `src/movie_recommender/curation/` — role-based film-week curation and LLM-generated discovery.
+- `src/movie_recommender/analysis/` — taste analysis and film reflection logic.
+- `src/movie_recommender/data/` — SQLite schema and access, Letterboxd imports, ratings, and RSS sync.
+- `src/movie_recommender/integrations/` — TMDb, OMDb, and LLM provider clients.
+- `src/movie_recommender/ui/` — Streamlit UI and reflection panel.
+- `scripts/` — command-line tools for database setup, TMDb enrichment, and Letterboxd sync.
 - `tests/` — tests for recommendation, curation, database, sync, theme similarity, and reflection behavior.
 
 ### Recommendation flow

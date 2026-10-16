@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from io import StringIO
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -9,8 +10,8 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import pandas as pd
 
-from recommender import ensure_export_dir, load_letterboxd, normalize_movie_key, load_feedback
-from tmdb_client import metadata_from_cache
+from movie_recommender.recommendations.recommender import ensure_export_dir, load_letterboxd, normalize_movie_key, load_feedback
+from movie_recommender.integrations.tmdb_client import metadata_from_cache
 
 DB_PATH = Path("data/movie_recommender.sqlite")
 
@@ -1034,7 +1035,7 @@ def load_curated_week(week_id: int, db_path: str | Path = DB_PATH) -> pd.DataFra
         row = conn.execute("SELECT movies_json FROM curated_weeks WHERE id=?", (week_id,)).fetchone()
     if row is None:
         return pd.DataFrame()
-    return pd.read_json(row["movies_json"], orient="records")
+    return pd.read_json(StringIO(row["movies_json"]), orient="records")
 
 
 def save_feedback_to_db(movie_id_value: str, feedback_value: str, scope: str = "recommendation", db_path: str | Path = DB_PATH) -> None:

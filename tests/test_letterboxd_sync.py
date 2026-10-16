@@ -4,7 +4,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from letterboxd_sync import (
+from movie_recommender.data.letterboxd_sync import (
     _parse_rating,
     _title_year_from_title,
     apply_sync_overlays,
