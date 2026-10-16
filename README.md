@@ -1,67 +1,107 @@
-# Personal Movie Recommender MVP
+# Personal Movie Discovery
 
-This repository is a small personal movie recommender that combines your Letterboxd export with TMDb metadata to produce watch recommendations and explanations.
+A local Streamlit app for exploring a Letterboxd film library, finding films to watch, and understanding your taste. It combines your Letterboxd export and recent Letterboxd activity with TMDb metadata, configurable recommendation signals, curated film weeks, and optional LLM-assisted discovery.
 
-**What it does**
-- Ranks unwatched items using Letterboxd signals (custom lists, decade affinity, recency) plus a TMDb-based content-similarity score (TF‑IDF on genres/directors/cast/keywords/overview).
-- Lets you give feedback (`more_like_this` / `less_like_this`) that adjusts scores.
-- Provides a lightweight evaluation page that tests how well similarity predicts past ratings.
+## Features
 
-Prerequisites
-- Python 3.9+ (use a virtual environment)
-- Recommended packages listed in `requirements.txt`.
-- Optional: install `statsmodels` to enable a trendline on the evaluation chart: `pip install statsmodels`.
+- **Personal recommendations:** rank films from your watchlist or discover candidates outside it. Scoring can combine decade and recency preferences, Letterboxd list membership, content and thematic similarity, director/writer/cast affinity, an optional anchor film, and saved feedback.
+- **Explanations and tuning:** inspect recommendation reasons and score components, adjust signal weights, and give positive or negative feedback. Feedback can also be applied while tuning recommendations against films you have already watched.
+- **Curated film weeks:** build an ordered programme around an anchor film, with narrative roles and styles such as balanced, director-focused, theme-focused, or vibe-focused.
+- **Filmweek discovery:** optionally use an LLM provider to generate discovery picks informed by a digest of your taste. Provider packages are included in `requirements.txt`; configure the key for the provider you select.
+- **Taste and rating analysis:** explore ratings over time, entity affinity, feedback and reflection patterns, list affinity, and comparisons with mainstream ratings.
+- **Film reflections:** record category-level judgements and evidence about a film to help understand and refine your preferences.
+- **Metadata enrichment:** use TMDb for genres, credits, keywords, descriptions, recommendations, and similar films. OMDb can provide additional ratings where configured.
+- **Letterboxd sync:** optionally fetch recent diary and rating activity from Letterboxd RSS and apply it as an incremental overlay.
 
-Quick setup
+## Requirements
+
+- Python 3.9 or newer
+- Packages in `requirements.txt`
+- A Letterboxd export ZIP for your library
+- A TMDb API key for metadata enrichment
+
+Optional packages and credentials:
+
+- `sentence-transformers` enables local embedding-based thematic similarity. Without it, thematic similarity falls back to TF-IDF.
+- `statsmodels` enables a trendline on the evaluation chart.
+- LLM provider credentials are needed only when using the corresponding Filmweek backend. See `.env.example` for supported environment variable names.
+- Letterboxd RSS sync can use `LETTERBOXD_USERNAME` or `LETTERBOXD_RSS_CLIENT_ID` (which may be a direct RSS feed URL).
+
+## Setup
 
 ```bash
 python -m venv .venv
-# Windows PowerShell
-.\.venv\Scripts\Activate.ps1
-# macOS / Linux
-# source .venv/bin/activate
+source .venv/bin/activate          # macOS / Linux
+# .venv\Scripts\Activate.ps1      # Windows PowerShell
 pip install -r requirements.txt
 ```
 
-TMDb API key
-- To enrich metadata and enable better content-similarity, set your TMDb API key in the environment or create a `.env` file containing:
+Set credentials in your shell or create a `.env` file in the project root. At minimum, set the TMDb key:
 
+```dotenv
+TMDB_API_KEY=your_tmdb_api_key
+LETTERBOXD_USERNAME=your_letterboxd_username
 ```
-TMDB_API_KEY=your_api_key_here
-```
 
-Usage
+See `.env.example` for optional service keys and settings. Do not commit `.env` or personal exports.
 
-- Place your Letterboxd export file at `data/letterboxd_export.zip` (the app expects the standard Letterboxd export structure).
-- Start the Streamlit app:
+Put the standard Letterboxd export ZIP at `data/letterboxd_export.zip`. The `data/` directory is ignored by Git because it contains personal exports, local databases, caches, and sync files.
+
+## Run the app
 
 ```bash
 streamlit run app.py
 ```
 
-- Use the sidebar to fetch TMDb metadata (small batches recommended initially), toggle recommendation source (watchlist / outside-watchlist), and view evaluation.
+The app loads its library from the SQLite database when one exists; otherwise it can use the Letterboxd export and file-based metadata. Use the database controls in the app to build or rebuild the SQLite library after importing new data. If RSS sync credentials are configured, the app can sync recent activity at startup (at most once per session when the last sync is over an hour old).
 
-Files of interest
-- `recommender.py` — scoring, content-similarity, explainers, and recommendation builder.
-- `tmdb_client.py` / `enrich_tmdb.py` — fetching and caching TMDb metadata.
-- `app.py` — Streamlit UI.
+Use the sidebar to manage metadata enrichment, recommendation settings, discovery modes, and analysis. TMDb enrichment can also be run from the command line:
 
-UI notes
-- The recommendations table shows a concise `why` summary; click a movie in the details pane to see the full `why_details` explanation and matched lists/taste matches.
-- The evaluation page will fall back to a plain scatter plot if `statsmodels` is not installed.
+```bash
+python enrich_tmdb.py --limit 100
+```
 
-Customization
-- To reduce/increase the influence of list-based signals, edit the constants in `recommender.py`:
-  - `LIST_SCORE_SCALE` — scales per-list scoring contribution
-  - `LIST_COUNT_WEIGHT` — weight for number of lists the movie appears on
+To sync Letterboxd RSS manually and inspect sync status:
 
-Git / Data
-- The repository includes a `.gitignore` that ignores `data/` and common non-essential files (`*.csv`, `*.env`, Excel files, archives, virtualenvs, caches, IDE folders).
-- If you want to keep an empty `data/` folder in the repo, add a `data/.gitkeep` file.
+```bash
+python sync_letterboxd.py YOUR_LETTERBOXD_USERNAME --status
+```
 
-Troubleshooting
-- If the app fails to show TMDb metadata, run the enrich step again and check `data/tmdb_cache.json`.
-- If evaluation errors reference `statsmodels`, install it as noted above.
+## Architecture
 
-Questions or next steps
-- I can add a short developer guide with tests and example commands, or create `data/.gitkeep` for you — which would you prefer?
+- `app.py` — Streamlit application, navigation, UI rendering, and startup sync.
+- `recommender.py` — candidate selection, recommendation scoring, explanations, and feedback handling.
+- `theme_similarity.py` — thematic similarity shared by recommendations and curated programmes; uses sentence-transformer embeddings when installed and TF-IDF otherwise.
+- `curator.py` — role-based, ordered film-week curation around an anchor.
+- `llm_curator.py` and `llm_providers.py` — LLM-generated Filmweek discovery and provider integrations.
+- `movie_database.py` and `init_database.py` — SQLite schema, imports, data access, and database rebuilds.
+- `letterboxd_sync.py` — RSS parsing, incremental event storage, and overlay application.
+- `tmdb_client.py` and `omdb_client.py` — external metadata clients; `enrich_tmdb.py` provides a TMDb enrichment command.
+- `analysis.py`, `reflection.py`, and `rate_review.py` — analysis helpers and film reflection workflows.
+- `tests/` — tests for recommendation, curation, database, sync, theme similarity, and reflection behavior.
+
+### Recommendation flow
+
+Letterboxd export → normalized library data → optional RSS overlays → candidate selection → scoring and explanations → Streamlit results. When SQLite is present, the app reads library data from the database. The shared movie key is `movie_id`, formatted as `lowercase title (year)`.
+
+The recommender combines several independently weighted signals. Content similarity uses genres, directors, cast, keywords, and overview; thematic similarity uses keywords and overview, separate from genre and credits. Feedback and mood avoidance can adjust results, and an anchor film can focus the recommendation toward a specific concept. The controls and scoring constants are documented in `CLAUDE.md` and `AGENT.md`.
+
+## Development
+
+Run the test suite with:
+
+```bash
+pytest tests/
+```
+
+Run one test with:
+
+```bash
+pytest tests/test_recommender.py::test_build_recommendations_no_metadata_returns_results
+```
+
+See `AGENT.md` for repository-specific development commands, architecture details, and data-handling guidance. `CLAUDE.md` contains the corresponding Claude Code notes.
+
+## Local data and privacy
+
+The app stores its SQLite database, Letterboxd exports, TMDb cache, theme embeddings, feedback, and sync overlays under `data/`. These files are ignored by Git. Keep API keys in environment variables or `.env`; never add personal exports or credentials to commits.
