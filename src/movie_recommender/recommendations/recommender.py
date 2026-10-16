@@ -151,6 +151,8 @@ def load_letterboxd(export_dir: str | Path) -> Dict[str, pd.DataFrame]:
         "ratings": normalize_movie_key(_read_csv(base / "ratings.csv")),
         "watched": normalize_movie_key(_read_csv(base / "watched.csv")),
         "diary": normalize_movie_key(_read_csv(base / "diary.csv")),
+        # Letterboxd exports review text separately from diary events.
+        "reviews": normalize_movie_key(_read_csv(base / "reviews.csv")),
         "watchlist": normalize_movie_key(_read_csv(base / "watchlist.csv")),
         "likes": normalize_movie_key(_read_csv(base / "likes" / "films.csv")),
     }

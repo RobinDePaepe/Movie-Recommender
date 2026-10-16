@@ -272,6 +272,33 @@ def inject_theme() -> None:
             background: rgba(255,255,255,0.02);
         }
 
+        /* ---- Curated week engine switch ---- */
+        .st-key-curation-engine-switch {
+            max-width: 760px;
+            padding: 0.85rem 1rem 0.55rem;
+            border: 1px solid rgba(201,162,39,0.22);
+            border-radius: 12px;
+            background: linear-gradient(135deg, rgba(255,255,255,0.045), rgba(201,162,39,0.035));
+            box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+        }
+        .st-key-curation-engine-switch [data-testid="stSegmentedControl"] {
+            width: 100%;
+        }
+        .st-key-curation-engine-switch [data-testid="stSegmentedControl"] button {
+            min-height: 2.65rem;
+            border-radius: 8px;
+            font-weight: 600;
+            transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .st-key-curation-engine-switch [data-testid="stSegmentedControl"] button[aria-pressed="true"] {
+            color: #F5E6A8;
+            background: linear-gradient(135deg, rgba(201,162,39,0.25), rgba(201,162,39,0.12));
+            box-shadow: 0 0 0 1px rgba(201,162,39,0.5) inset, 0 3px 10px rgba(0,0,0,0.2);
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .st-key-curation-engine-switch [data-testid="stSegmentedControl"] button { transition: none; }
+        }
+
         /* ---- Headings ---- */
         h1, h2, h3 { letter-spacing: -0.01em; }
         </style>
@@ -1570,16 +1597,19 @@ elif page == "Evaluation":
 
 elif page == "Curated Weeks":
     st.subheader("Curated movie week")
-    cw_mode = st.radio(
-        "Curation engine",
-        ["Your library (deterministic)", "AI discovery (web search)"],
-        horizontal=True,
-        help=(
-            "Your library scores movies already in your Letterboxd/TMDb data. "
-            "AI discovery asks Claude to build a themed week around any film — including "
-            "titles you've never logged and brand-new releases verified via web search."
-        ),
-    )
+    with st.container(key="curation-engine-switch"):
+        cw_mode = st.segmented_control(
+            "Curation engine",
+            ["Your library (deterministic)", "AI discovery (web search)"],
+            default="Your library (deterministic)",
+            selection_mode="single",
+            key="curation_engine",
+            help=(
+                "Your library scores movies already in your Letterboxd/TMDb data. "
+                "AI discovery asks Claude to build a themed week around any film — including "
+                "titles you've never logged and brand-new releases verified via web search."
+            ),
+        ) or "Your library (deterministic)"
 
     if cw_mode == "AI discovery (web search)":
         st.write(

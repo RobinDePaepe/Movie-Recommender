@@ -72,6 +72,8 @@ This top 4 for is identical when I select the standard weights (all =1) , taste 
         - The graphs are visually jarring (coloring, too basic of a setup both from a visual as well as substantive level), Considering if these visuals should live separate from the tune watched movies function ( and maybe move it to a "My taste profile overview"-page)
 
 ### Curated Weeks:
+- **AI discovery can invent historical film entries (2026-10-16).** With Ollama (`qwen3.5`), anchor *Whiplash* (2014), and classic cutoff before 1980, the generated “Film-historical anchor” was *Whiplash* (1962), dir. Lee H. Katzin, with a confident claim that it was an earlier jazz-drum/mentor-student film. This appears to conflate the anchor's title and setting; no matching 1962 feature film is known. The UI stated that web verification is unavailable for Ollama. **Expected:** generated titles, years, and directors should be checked against a film catalog before being presented as verified facts; if identity cannot be confirmed, reject or label the pick as unverified and offer a replacement. **Reproduction:** Curated Weeks → AI discovery → Ollama/qwen3.5; anchor `Whiplash 2014`; classic pick `before 1980`; compose. **Follow-up:** catalog-backed identity validation for every generated pick, with regression coverage for invented title/year/director combinations and degraded behavior when verification is unavailable.
+
 - The selection of movies seems too random still and genre overlap seems to be too dominant of a factor (f.e. Mission Impossible recommendations when selecting Inception as a movie anchor)
 
 - When I try "Director Focused" For Robert Eggers'Nosferatu there is some Good recommendations, but it still needs some work

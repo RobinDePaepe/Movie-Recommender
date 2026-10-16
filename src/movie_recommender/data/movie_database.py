@@ -358,11 +358,32 @@ def import_letterboxd_export(export_zip: str | Path = "data/letterboxd_export.zi
 
             diary = data.get("diary", pd.DataFrame()).copy()
             if not diary.empty:
+                # Letterboxd puts review text in reviews.csv rather than diary.csv.
+                # Join on the normalized film key and watched date so reviews attach
+                # to the corresponding viewing event (not the diary-entry date).
+                reviews = data.get("reviews", pd.DataFrame()).copy()
+                review_by_event: Dict[Tuple[str, str], str] = {}
+                if not reviews.empty and "Review" in reviews.columns:
+                    for _, review_row in reviews.iterrows():
+                        review_text = review_row.get("Review", "")
+                        if pd.isna(review_text) or not str(review_text).strip():
+                            continue
+                        review_date = str(review_row.get("Watched Date", review_row.get("Date", "")))
+                        review_by_event[(str(review_row.get("movie_id", "")), review_date)] = str(review_text)
                 for _, row in diary.iterrows():
                     mid = upsert_movie(conn, row["Name"], row["Year"], uri=row.get("Letterboxd URI", ""))
                     rating = pd.to_numeric(row.get("Rating"), errors="coerce")
                     rewatch = str(row.get("Rewatch", "")).lower() in {"yes", "true", "1"}
-                    conn.execute("INSERT OR IGNORE INTO watched_events(movie_id, watched_date, rewatch, rating, review_text, source, source_event_id, date_kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (mid, row.get("Watched Date", row.get("Date", "")), int(rewatch), None if pd.isna(rating) else float(rating), row.get("Review", ""), "letterboxd_diary", f"diary:{mid}:{row.get('Watched Date', row.get('Date',''))}:{row.get('Rating','')}", "exact", utc_now()))
+                    watched_date = str(row.get("Watched Date", row.get("Date", "")))
+                    review_text = row.get("Review", "")
+                    if pd.isna(review_text) or not str(review_text).strip():
+                        review_text = review_by_event.get((mid, watched_date), "")
+                    event_id = f"diary:{mid}:{watched_date}:{row.get('Rating','')}"
+                    conn.execute("INSERT OR IGNORE INTO watched_events(movie_id, watched_date, rewatch, rating, review_text, source, source_event_id, date_kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (mid, watched_date, int(rewatch), None if pd.isna(rating) else float(rating), str(review_text), "letterboxd_diary", event_id, "exact", utc_now()))
+                    # Existing rows are intentionally refreshed: prior versions inserted
+                    # the event with empty text because reviews.csv was not imported.
+                    if str(review_text).strip():
+                        conn.execute("UPDATE watched_events SET review_text=? WHERE movie_id=? AND watched_date=? AND source='letterboxd_diary' AND (review_text IS NULL OR trim(review_text)='')", (str(review_text), mid, watched_date))
                     counts["watched_events"] += 1
 
             watchlist = data.get("watchlist", pd.DataFrame()).copy()

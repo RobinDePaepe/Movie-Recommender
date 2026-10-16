@@ -54,6 +54,7 @@ The main product and engineering goal is to build the modules needed to realize 
 
 - Build a dedicated Taste Profile experience for taste composition and change over time, and improve the visual hierarchy of existing analysis views.
 - Improve Curated Weeks interaction: pin, replace, reorder, and complete slots; then refine emotional pacing and repetition control.
+- Validate every AI-discovery pick against a film catalog (title, release year, and director) before presenting it as a factual film; clearly label or replace unverified candidates when catalog verification is unavailable. See the *Whiplash* / Ollama reproduction in `../archive/testing-feedback.md`.
 - Add watchlist aging using age, intent, availability, and prompts about why a title remains unwatched.
 - Improve onboarding and empty states so setup progress and missing data are clear.
 
