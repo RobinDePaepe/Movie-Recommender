@@ -52,6 +52,7 @@ python scripts/sync_letterboxd.py YOUR_LETTERBOXD_USERNAME --status
 Optional packages:
 
 - `sentence-transformers` enables semantic theme embeddings; without it, theme similarity uses the TF-IDF fallback.
+- Local retrieval chunking and embeddings can be built with `python scripts/build_retrieval_index.py`; install the optional model dependency with `pip install -e '.[embeddings]'`.
 - `statsmodels` enables a trendline on the evaluation chart.
 
 ## Environment and local data

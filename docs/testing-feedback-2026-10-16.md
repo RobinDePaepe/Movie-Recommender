@@ -2,6 +2,11 @@
 ✅ Done · 🟡 Partial · 🔴 Not addressed · 🔵 Needs live verification
 
 ## Overall
+- 🔴 Recommendation cards show strongly negative match scores alongside exclusively positive “Why?” explanations (2026-10-17)
+  - **Observed:** with the decade filter set to the 1950s, *Strangers on a Train* (-12.74), *The Caine Mutiny* (-13.06), *The Wages of Fear* (-16.06), and *Ben-Hur* (-20.36) all showed positive reasons such as rewatch similarity, trusted director/cast, list appearances, decade affinity, and positive feedback. The detailed “Why?” text also listed only positive evidence, so it did not explain the large negative totals.
+  - **Likely cause to investigate:** `add_content_similarity()` subtracts similarity to disliked films, then scales `content_similarity` by the maximum candidate value without bounding the negative side. If that maximum is small, negative taste-similarity contributions may become disproportionately large. The explanation helpers appear to report positive thresholds/signals and do not state the size of negative score components.
+  - **Expected:** keep the displayed score scale interpretable and ensure explanations or the visible breakdown identify the negative components that materially lower a film's score.
+  - **Follow-up:** reproduce from the current dataset and inspect per-component contributions for these four films; confirm whether content-score scaling is responsible before changing the formula. Add regression coverage for strongly negative candidates and explanation visibility.
 - ✅ Score breakdown is a bit too black box still from within the interface, especially taste profiling and list signals
   - `render_score_breakdown()` (app.py) charts per-component contributions on Tonight's Pick + Recommendations, and now prints a plain-language sentence under each bar (`_component_explanations()`, app.py) — e.g. "List signals (+2.05): In 3 list(s): Top 250, Watchlist 2026" or "Taste similarity (+2.57): Matches your high-rated films on genres: ...". Sourced from data the pipeline already computed (`list_names`, `taste_matches`, `avg_user_rating`) but never surfaced.
 - 🟡 Additionally it seems that list signals are too simplistic, just because a movie is in a couple of list does not mean that the movie should be a top candidate

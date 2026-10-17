@@ -67,6 +67,15 @@ To sync Letterboxd RSS manually and inspect sync status:
 python scripts/sync_letterboxd.py YOUR_LETTERBOXD_USERNAME --status
 ```
 
+To build or refresh the local retrieval chunks and embeddings, install the optional local model dependency and run:
+
+```bash
+pip install -e '.[embeddings]'
+python scripts/build_retrieval_index.py
+```
+
+The model runs locally and may download its pinned weights the first time. This command does not use a hosted embedding API.
+
 ## Architecture
 
 - `app.py` — thin Streamlit launcher for `src/movie_recommender/ui/app.py`.

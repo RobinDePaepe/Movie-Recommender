@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
+import unicodedata
 from io import StringIO
 import sqlite3
 from contextlib import contextmanager
@@ -80,6 +83,50 @@ def init_db(db_path: str | Path = DB_PATH) -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(movie_id, watched_date, source_event_id)
             );
+
+            CREATE TABLE IF NOT EXISTS retrieval_corpus (
+                record_id TEXT PRIMARY KEY,
+                movie_id TEXT NOT NULL REFERENCES movies(movie_id) ON DELETE CASCADE,
+                source TEXT NOT NULL,
+                source_event_id TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                text TEXT NOT NULL DEFAULT '',
+                watched_date TEXT,
+                rating REAL,
+                rewatch INTEGER,
+                tmdb_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(source, source_event_id, content_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrieval_corpus_movie ON retrieval_corpus(movie_id);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_corpus_source_type ON retrieval_corpus(source, content_type);
+
+            CREATE TABLE IF NOT EXISTS retrieval_chunks (
+                chunk_id TEXT PRIMARY KEY,
+                record_id TEXT NOT NULL REFERENCES retrieval_corpus(record_id) ON DELETE CASCADE,
+                chunk_index INTEGER NOT NULL,
+                chunker_version TEXT NOT NULL,
+                text TEXT NOT NULL,
+                text_hash TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(record_id, chunker_version, chunk_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrieval_chunks_record ON retrieval_chunks(record_id);
+
+            CREATE TABLE IF NOT EXISTS retrieval_embeddings (
+                chunk_id TEXT PRIMARY KEY REFERENCES retrieval_chunks(chunk_id) ON DELETE CASCADE,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                vector_dimension INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                source_text_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrieval_embeddings_model ON retrieval_embeddings(model_id, model_revision);
 
             CREATE TABLE IF NOT EXISTS watchlist (
                 movie_id TEXT PRIMARY KEY REFERENCES movies(movie_id) ON DELETE CASCADE,
@@ -324,6 +371,41 @@ def upsert_movie(conn: sqlite3.Connection, name: str, year: Any, uri: str = "", 
     return mid
 
 
+def _source_event_id(row: Any, movie_id_value: str, watched_date: str, occurrence: int) -> str:
+    """Return an event identifier independent of mutable review text and rating."""
+    for field in ("Review URI", "Diary URI", "Event ID", "event_id", "GUID"):
+        value = row.get(field, "")
+        if value is not None and not pd.isna(value) and str(value).strip():
+            return str(value).strip()
+    return f"letterboxd:{movie_id_value}:{watched_date or 'unknown-date'}:{occurrence}"
+
+
+def _upsert_corpus_record(
+    conn: sqlite3.Connection, *, movie_id_value: str, source: str, source_event_id: str,
+    content_type: str, text: str = "", watched_date: str | None = None,
+    rating: float | None = None, rewatch: int | None = None, tmdb_id: int | None = None,
+) -> None:
+    now = utc_now()
+    record_id = hashlib.sha256(f"{source}\0{source_event_id}\0{content_type}".encode("utf-8")).hexdigest()
+    conn.execute(
+        """INSERT INTO retrieval_corpus
+           (record_id,movie_id,source,source_event_id,content_type,text,watched_date,rating,rewatch,tmdb_id,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(source,source_event_id,content_type) DO UPDATE SET
+             movie_id=excluded.movie_id,text=excluded.text,watched_date=excluded.watched_date,
+             rating=excluded.rating,rewatch=excluded.rewatch,tmdb_id=excluded.tmdb_id,
+             updated_at=CASE WHEN retrieval_corpus.movie_id IS NOT excluded.movie_id
+               OR retrieval_corpus.text IS NOT excluded.text
+               OR retrieval_corpus.watched_date IS NOT excluded.watched_date
+               OR retrieval_corpus.rating IS NOT excluded.rating
+               OR retrieval_corpus.rewatch IS NOT excluded.rewatch
+               OR retrieval_corpus.tmdb_id IS NOT excluded.tmdb_id
+               THEN excluded.updated_at ELSE retrieval_corpus.updated_at END""",
+        (record_id, movie_id_value, source, source_event_id, content_type, text, watched_date,
+         rating, rewatch, tmdb_id, now, now),
+    )
+
+
 def import_letterboxd_export(export_zip: str | Path = "data/letterboxd_export.zip", db_path: str | Path = DB_PATH, export_dir: str | Path = "data/letterboxd") -> Dict[str, int]:
     init_db(db_path)
     data = load_letterboxd(ensure_export_dir(export_zip, export_dir))
@@ -353,7 +435,14 @@ def import_letterboxd_export(export_zip: str | Path = "data/letterboxd_export.zi
             if not watched.empty:
                 for _, row in watched.iterrows():
                     mid = upsert_movie(conn, row["Name"], row["Year"], uri=row.get("Letterboxd URI", ""))
-                    conn.execute("INSERT OR IGNORE INTO watched_events(movie_id, watched_date, rewatch, rating, review_text, source, source_event_id, date_kind, created_at) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)", (mid, 0, None, "", "letterboxd_export", f"watched:{mid}", "unknown", utc_now()))
+                    watched_event_id = f"watched:{mid}"
+                    conn.execute(
+                        """INSERT INTO watched_events(movie_id, watched_date, rewatch, rating, review_text, source, source_event_id, date_kind, created_at)
+                           SELECT ?, NULL, ?, ?, ?, ?, ?, ?, ?
+                           WHERE NOT EXISTS (SELECT 1 FROM watched_events WHERE movie_id=? AND source=? AND source_event_id=?)""",
+                        (mid, 0, None, "", "letterboxd_export", watched_event_id, "unknown", utc_now(),
+                         mid, "letterboxd_export", watched_event_id),
+                    )
                     counts["watched_events"] += 1
 
             diary = data.get("diary", pd.DataFrame()).copy()
@@ -362,28 +451,70 @@ def import_letterboxd_export(export_zip: str | Path = "data/letterboxd_export.zi
                 # Join on the normalized film key and watched date so reviews attach
                 # to the corresponding viewing event (not the diary-entry date).
                 reviews = data.get("reviews", pd.DataFrame()).copy()
-                review_by_event: Dict[Tuple[str, str], str] = {}
+                review_by_event: Dict[Tuple[str, str], list[Any]] = {}
                 if not reviews.empty and "Review" in reviews.columns:
                     for _, review_row in reviews.iterrows():
                         review_text = review_row.get("Review", "")
                         if pd.isna(review_text) or not str(review_text).strip():
                             continue
-                        review_date = str(review_row.get("Watched Date", review_row.get("Date", "")))
-                        review_by_event[(str(review_row.get("movie_id", "")), review_date)] = str(review_text)
+                        review_date_value = review_row.get("Watched Date", review_row.get("Date", ""))
+                        review_date = "" if pd.isna(review_date_value) else str(review_date_value)
+                        if review_date.lower() in {"nan", "nat", "none", "<na>"}:
+                            review_date = ""
+                        review_by_event.setdefault((str(review_row.get("movie_id", "")), review_date), []).append(review_row)
+                diary_occurrences: Dict[Tuple[str, str], int] = {}
+                review_occurrences: Dict[Tuple[str, str], int] = {}
                 for _, row in diary.iterrows():
                     mid = upsert_movie(conn, row["Name"], row["Year"], uri=row.get("Letterboxd URI", ""))
                     rating = pd.to_numeric(row.get("Rating"), errors="coerce")
                     rewatch = str(row.get("Rewatch", "")).lower() in {"yes", "true", "1"}
-                    watched_date = str(row.get("Watched Date", row.get("Date", "")))
+                    watched_date_value = row.get("Watched Date", row.get("Date", ""))
+                    watched_date = "" if pd.isna(watched_date_value) else str(watched_date_value)
+                    if watched_date.lower() in {"nan", "nat", "none", "<na>"}:
+                        watched_date = ""
+                    event_key = (mid, watched_date)
+                    occurrence = diary_occurrences.get(event_key, 0)
+                    diary_occurrences[event_key] = occurrence + 1
                     review_text = row.get("Review", "")
+                    review_row = None
                     if pd.isna(review_text) or not str(review_text).strip():
-                        review_text = review_by_event.get((mid, watched_date), "")
-                    event_id = f"diary:{mid}:{watched_date}:{row.get('Rating','')}"
-                    conn.execute("INSERT OR IGNORE INTO watched_events(movie_id, watched_date, rewatch, rating, review_text, source, source_event_id, date_kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (mid, watched_date, int(rewatch), None if pd.isna(rating) else float(rating), str(review_text), "letterboxd_diary", event_id, "exact", utc_now()))
-                    # Existing rows are intentionally refreshed: prior versions inserted
-                    # the event with empty text because reviews.csv was not imported.
-                    if str(review_text).strip():
-                        conn.execute("UPDATE watched_events SET review_text=? WHERE movie_id=? AND watched_date=? AND source='letterboxd_diary' AND (review_text IS NULL OR trim(review_text)='')", (str(review_text), mid, watched_date))
+                        candidates = review_by_event.get(event_key, [])
+                        next_review = review_occurrences.get(event_key, 0)
+                        if candidates:
+                            # Prefer a review with matching mutable diary context, then
+                            # use stable export order for same-day repeat viewings.
+                            matched = next((i for i, candidate in enumerate(candidates)
+                                            if i >= next_review and pd.to_numeric(candidate.get("Rating"), errors="coerce") == rating
+                                            and str(candidate.get("Rewatch", "")).lower() in {str(rewatch).lower(), "yes" if rewatch else "no"}), None)
+                            selected = matched if matched is not None else min(next_review, len(candidates) - 1)
+                            review_row = candidates[selected]
+                            review_text = review_row.get("Review", "")
+                            review_occurrences[event_key] = selected + 1
+                        else:
+                            review_text = ""
+                    else:
+                        review_text = str(review_text)
+                    review_text = "" if pd.isna(review_text) else str(review_text)
+                    event_source_row = review_row if review_row is not None else row
+                    event_id = _source_event_id(event_source_row, mid, watched_date, occurrence)
+                    event_rating = None if pd.isna(rating) else float(rating)
+                    conn.execute(
+                        """INSERT INTO watched_events(movie_id, watched_date, rewatch, rating, review_text, source, source_event_id, date_kind, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(movie_id, watched_date, source_event_id) DO UPDATE SET
+                             rewatch=excluded.rewatch,rating=excluded.rating,review_text=excluded.review_text,date_kind=excluded.date_kind""",
+                        (mid, watched_date, int(rewatch), event_rating, review_text, "letterboxd_diary", event_id, "exact", utc_now()),
+                    )
+                    _upsert_corpus_record(conn, movie_id_value=mid, source="letterboxd_diary", source_event_id=event_id,
+                                          content_type="diary_event", watched_date=watched_date or None,
+                                          rating=event_rating, rewatch=int(rewatch))
+                    if review_text.strip():
+                        _upsert_corpus_record(conn, movie_id_value=mid, source="letterboxd_diary", source_event_id=event_id,
+                                              content_type="review_text", text=review_text, watched_date=watched_date or None,
+                                              rating=event_rating, rewatch=int(rewatch))
+                    else:
+                        conn.execute("DELETE FROM retrieval_corpus WHERE source=? AND source_event_id=? AND content_type='review_text'",
+                                     ("letterboxd_diary", event_id))
                     counts["watched_events"] += 1
 
             watchlist = data.get("watchlist", pd.DataFrame()).copy()
@@ -423,6 +554,7 @@ def import_tmdb_cache(cache_path: str | Path = "data/tmdb_cache.json", db_path: 
     cache = json.loads(cache_path.read_text(encoding="utf-8"))
     imported = 0
     with connect(db_path) as conn:
+        title_index = _tmdb_title_index(conn)
         for entry in cache.values():
             if isinstance(entry, str):
                 continue
@@ -430,10 +562,122 @@ def import_tmdb_cache(cache_path: str | Path = "data/tmdb_cache.json", db_path: 
             year = entry.get("year")
             if not name:
                 continue
-            mid = upsert_movie(conn, name, year, tmdb_id=entry.get("tmdb_id"))
+            mid = None
+            if entry.get("tmdb_found") and entry.get("tmdb_id"):
+                match = _canonical_movie_id_for_tmdb_entry(
+                    title_index, name, year, entry.get("tmdb_id"), entry.get("directors", []),
+                )
+                if match is not None:
+                    mid, indexed_row = match
+                    indexed_row["tmdb_id"] = int(entry["tmdb_id"])
+            if mid is None:
+                mid = upsert_movie(conn, name, year, tmdb_id=entry.get("tmdb_id"))
+            elif entry.get("tmdb_id"):
+                conn.execute(
+                    "UPDATE movies SET tmdb_id=?,updated_at=? WHERE movie_id=?",
+                    (int(entry["tmdb_id"]), utc_now(), mid),
+                )
             _upsert_metadata(conn, mid, entry)
+            tmdb_id = entry.get("tmdb_id")
+            for field, content_type in (("overview", "tmdb_overview"), ("genres", "tmdb_genres")):
+                raw_value = entry.get(field, "")
+                if isinstance(raw_value, (list, tuple, set)):
+                    text_value = ", ".join(str(value).strip() for value in raw_value if str(value).strip())
+                else:
+                    text_value = "" if raw_value is None or pd.isna(raw_value) else str(raw_value).strip()
+                source_event_id = f"tmdb:{mid}:{field}"
+                if text_value:
+                    _upsert_corpus_record(conn, movie_id_value=mid, source="tmdb", source_event_id=source_event_id,
+                                          content_type=content_type, text=text_value, tmdb_id=tmdb_id)
+                else:
+                    conn.execute("DELETE FROM retrieval_corpus WHERE source='tmdb' AND source_event_id=? AND content_type=?",
+                                 (source_event_id, content_type))
             imported += 1
     return imported
+
+
+def _normalized_title(value: Any) -> str:
+    """Normalize punctuation, accents, and spacing while keeping title words intact."""
+    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return "".join(char for char in text if char.isalnum())
+
+
+def _tmdb_title_index(conn: sqlite3.Connection) -> Dict[str, list[Dict[str, Any]]]:
+    rows = conn.execute(
+        "SELECT m.movie_id,m.name,m.year,m.tmdb_id, "
+        "(EXISTS(SELECT 1 FROM watchlist w WHERE w.movie_id=m.movie_id) "
+        "OR EXISTS(SELECT 1 FROM ratings r WHERE r.movie_id=m.movie_id) "
+        "OR EXISTS(SELECT 1 FROM watched_events e WHERE e.movie_id=m.movie_id) "
+        "OR EXISTS(SELECT 1 FROM likes l WHERE l.movie_id=m.movie_id) "
+        "OR EXISTS(SELECT 1 FROM list_entries le WHERE le.movie_id=m.movie_id)"
+        ") AS tracked,md.directors FROM movies m LEFT JOIN movie_metadata md USING(movie_id) "
+        "WHERE COALESCE(m.record_status,'active')='active'"
+    ).fetchall()
+    index: Dict[str, list[Dict[str, Any]]] = {}
+    for row in rows:
+        item = dict(row)
+        try:
+            item["directors"] = json.loads(item["directors"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            item["directors"] = []
+        index.setdefault(_normalized_title(row["name"]), []).append(item)
+    return index
+
+
+def _canonical_movie_id_for_tmdb_entry(
+    title_index: Dict[str, list[Dict[str, Any]]], name: str, year: Any, tmdb_id: Any,
+    directors: Any = None,
+) -> tuple[str, Dict[str, Any]] | None:
+    """Attach TMDb metadata to a unique Letterboxd title despite small year drift.
+
+    Exact title and year wins. A one-year difference is accepted only when it identifies
+    one active local title and doesn't conflict with a different TMDb identity. Wider
+    differences and ambiguous matches remain separate for manual review.
+    """
+    normalized = _normalized_title(name)
+    if not normalized:
+        return None
+    same_title = title_index.get(normalized, [])
+    if not same_title:
+        return None
+
+    incoming_year = _safe_year(year)
+    if incoming_year is None:
+        return None
+    nearby = [
+        row for row in same_title
+        if _safe_year(row["year"]) is not None
+        and abs(_safe_year(row["year"]) - incoming_year) <= 1
+    ]
+    tracked = [row for row in nearby if row["tracked"]]
+    exact_tracked = [row for row in tracked if _safe_year(row["year"]) == incoming_year]
+    if exact_tracked:
+        candidates = exact_tracked
+    elif len(tracked) == 1:
+        candidates = tracked
+    else:
+        exact = [row for row in nearby if _safe_year(row["year"]) == incoming_year]
+        candidates = exact if exact else [row for row in nearby if abs(_safe_year(row["year"]) - incoming_year) == 1]
+    incoming_directors = {_normalized_title(value) for value in (directors or []) if str(value).strip()}
+    if len(candidates) > 1 and incoming_directors:
+        director_matches = [
+            row for row in candidates
+            if incoming_directors & {_normalized_title(value) for value in row.get("directors", [])}
+        ]
+        if len(director_matches) == 1:
+            candidates = director_matches
+    if len(candidates) != 1:
+        return None
+
+    candidate = candidates[0]
+    existing_directors = {_normalized_title(value) for value in candidate.get("directors", [])}
+    if incoming_directors and existing_directors and not incoming_directors.intersection(existing_directors):
+        return None
+    existing_tmdb_id = candidate["tmdb_id"]
+    if existing_tmdb_id is not None and tmdb_id is not None and int(existing_tmdb_id) != int(tmdb_id):
+        return None
+    return str(candidate["movie_id"]), candidate
 
 
 def apply_rss_overlays_to_db(sync_dir: str | Path = "data/sync", db_path: str | Path = DB_PATH) -> Dict[str, int]:
@@ -489,16 +733,23 @@ def apply_rss_overlays_to_db(sync_dir: str | Path = "data/sync", db_path: str | 
                 rating = pd.to_numeric(row.get("Rating"), errors="coerce")
                 rewatch = str(row.get("Rewatch", "")).lower() in {"yes", "true", "1"}
                 event_id = str(row.get("event_id", f"rss:{mid}:{row.get('Watched Date', '')}"))
+                watched_date = str(row.get("Watched Date", ""))
+                watched_date = "" if watched_date.lower() in {"nan", "nat", "none"} else watched_date
+                event_rating = None if pd.isna(rating) else float(rating)
                 conn.execute(
-                    "INSERT OR IGNORE INTO watched_events"
+                    "INSERT INTO watched_events"
                     "(movie_id, watched_date, rewatch, rating, review_text, source, source_event_id, date_kind, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(movie_id, watched_date, source_event_id) DO UPDATE SET"
+                    " rewatch=excluded.rewatch,rating=excluded.rating,date_kind=excluded.date_kind",
                     (
-                        mid, str(row.get("Watched Date", "")), int(rewatch),
-                        None if pd.isna(rating) else float(rating),
+                        mid, watched_date, int(rewatch), event_rating,
                         "", "letterboxd_rss", event_id, "exact", utc_now(),
                     ),
                 )
+                _upsert_corpus_record(conn, movie_id_value=mid, source="letterboxd_rss", source_event_id=event_id,
+                                      content_type="diary_event", watched_date=watched_date or None,
+                                      rating=event_rating, rewatch=int(rewatch))
                 counts["diary_added"] += 1
 
             _finish_run(conn, run_id, "ok", json.dumps(counts))
@@ -551,6 +802,7 @@ def rebuild_database(export_zip: str | Path = "data/letterboxd_export.zip", cach
     result: Dict[str, Any] = {}
     result["letterboxd"] = import_letterboxd_export(export_zip=export_zip, db_path=path)
     result["tmdb_metadata"] = import_tmdb_cache(cache_path=cache_path, db_path=path)
+    result["letterboxd_rss"] = apply_rss_overlays_to_db(db_path=path)
     result["feedback"] = import_feedback_csv(db_path=path)
     restored = 0
     with connect(path) as conn:
@@ -608,6 +860,19 @@ def load_metadata_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) and x.startswith("[") else ([] if pd.isna(x) else x))
     return df
+
+
+def load_retrieval_corpus(db_path: str | Path = DB_PATH) -> pd.DataFrame:
+    """Load normalized, provenance-aware review, diary, and TMDb corpus records."""
+    init_db(db_path)
+    with connect(db_path) as conn:
+        return pd.read_sql_query(
+            """SELECT rc.*,m.name AS movie_name,m.year AS movie_year,m.letterboxd_uri
+               FROM retrieval_corpus rc JOIN movies m USING(movie_id)
+               WHERE COALESCE(m.record_status,'active')='active'
+               ORDER BY rc.movie_id,rc.source,rc.source_event_id,rc.content_type""",
+            conn,
+        )
 
 
 def load_feedback_from_db(db_path: str | Path = DB_PATH) -> pd.DataFrame:

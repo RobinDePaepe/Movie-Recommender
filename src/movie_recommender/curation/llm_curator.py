@@ -93,7 +93,10 @@ def build_taste_digest(data: Dict[str, pd.DataFrame]) -> TasteDigest:
     watched = data.get("watched", pd.DataFrame())
 
     seen_keys: set = set()
-    for frame in (ratings, watched, data.get("watchlist", pd.DataFrame())):
+    # A watchlist entry means the user intends to watch the film; it is not
+    # evidence that they have already seen it. Ratings and watched events are
+    # the only sources that should drive the "already seen" badge.
+    for frame in (ratings, watched):
         if frame is not None and not frame.empty and "Name" in frame.columns:
             seen_keys |= {_norm_title(n) for n in frame["Name"].dropna()}
 

@@ -18,7 +18,5 @@ anthropic
 openai
 google-genai
 
-# Optional: enables *semantic* theme similarity (sentence-transformer embeddings of
-# keywords + overview). Without it, theme similarity falls back to TF-IDF over the same
-# text. Pulls in torch, so it is intentionally not a hard dependency.
-# pip install sentence-transformers
+# Optional: enables semantic theme similarity and local retrieval embeddings. It pulls in
+# torch, so it is intentionally not a hard dependency. Install with `pip install -e '.[embeddings]'`.

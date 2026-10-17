@@ -1,6 +1,6 @@
 # RAG Architecture
 
-Last reviewed: 2026-10-16.
+Last reviewed: 2026-10-17.
 
 The primary design goal is to implement the modules in [`RAG architecture.png`](RAG%20architecture.png). The application should answer natural-language questions using the user's Letterboxd history and movie metadata, retrieve the evidence behind those answers, and call the existing deterministic recommender when ranking is needed. Route structured library facts to SQLite and semantic questions about themes or review opinions to text retrieval; combine both paths when a question needs both.
 
@@ -24,7 +24,7 @@ The image labels SQLite scoring DB and pgvector store as existing/new components
 |---|---|---|
 | Letterboxd export | Implemented | Source of complete ratings, diary entries, reviews, watchlist, and lists. Imports must be repeatable and preserve source identifiers. |
 | TMDb API | Implemented | Enrich titles with plot, genres, credits, keywords, and stable TMDb identity. |
-| Ingestion and chunking | Partial foundation | Existing importers normalize export and TMDb data; SQLite diary records can retain review text. Review corpus normalization, chunking, embedding, and refresh-on-change are not implemented as one pipeline. |
+| Ingestion and chunking | Implemented through SQLite staging embeddings | Letterboxd export/RSS and TMDb cache imports populate a provenance-aware corpus. Nonempty review and TMDb text is chunked and embedded locally with edit/model refresh; pgvector serving remains future work. |
 | pgvector store | Not implemented | Store review-text embeddings and chunk metadata for semantic retrieval. Keep movie/source IDs that can be joined to SQLite records. Pair vector retrieval with PostgreSQL full-text search for exact titles, names, and phrases. |
 | SQLite library/recommender data | Implemented, with boundary to clarify | Keep canonical movie, rating, diary, feedback, reflection, availability, profile, and watchlist data. Scoring is currently calculated in the recommender module rather than stored as durable score rows. |
 | Agent orchestrator | Not implemented | Classify a user query, route to structured queries, semantic retrieval, or both, select from narrow application tools, assemble grounded results, and request a response from a configured LLM provider. It should not replace deterministic ranking. Make provider/data-sharing behavior explicit and preserve whether each claim came from personal review evidence, TMDb metadata, or computed results. |
@@ -34,9 +34,9 @@ The image labels SQLite scoring DB and pgvector store as existing/new components
 ## Module boundaries
 
 - **Import adapters** read Letterboxd exports, Letterboxd RSS overlays, and TMDb responses. They produce normalized records and do not call an LLM.
-- **Corpus builder** selects text fields, creates review/metadata chunks, records provenance, and detects additions, edits, and deletions.
+- **Corpus builder** selects text fields, creates review/metadata chunks, records provenance, and detects additions, edits, and deletions. `python scripts/build_retrieval_index.py` refreshes these SQLite staging chunks and embeddings.
 - **Data lifecycle** propagates edits and deletions through normalized corpus rows, chunks, embeddings, and retrieval caches. Provide a safe full-index clear/rebuild operation and confirm deleted text cannot still be retrieved.
-- **Embedding service** batches and versions embeddings. A model change must be visible so the corpus can be rebuilt consistently.
+- **Embedding service** batches and versions embeddings. The local `all-MiniLM-L6-v2` snapshot is pinned; a model/revision change rebuilds the active vectors consistently. The service boundary can accept a future hosted adapter, but this stage does not send review text to a provider.
 - **Vector repository** writes, deletes, and searches chunks in pgvector. It returns chunk text, similarity, and provenance rather than an untraceable text blob. Pair semantic retrieval with PostgreSQL full-text search, then fuse or rerank results; pgvector documents hybrid search with Reciprocal Rank Fusion and cross-encoders ([pgvector hybrid search](https://github.com/pgvector/pgvector#hybrid-search)).
 - **SQLite repositories and application services** remain the source for structured filters, ratings, watch state, feedback, profiles, and deterministic recommendations.
 - **Orchestrator** routes exact facts and filters to SQLite/application services, semantic questions to retrieval, and mixed questions to both. It constructs a bounded evidence context and produces a response with source references. Expose narrow tools and default to read-only behavior.
@@ -45,6 +45,37 @@ The image labels SQLite scoring DB and pgvector store as existing/new components
 - **UI** is a client of application services. It should not contain retrieval logic or direct SQL for the new RAG path.
 - **Evaluation** runs offline against fixed queries and held-out data, recording retrieval relevance, citation coverage, answer grounding, ranking metrics, and latency. Evaluate retrieval and generation separately; RAG evaluation research treats them as distinct components ([RAGAS paper](https://arxiv.org/abs/2309.15217)). Use the fixed set as a release gate when changing chunking, models, retrieval, prompts, or ranking integration.
 - **Answer feedback** (after the first usable chat flow) records whether an answer was useful and whether its cited evidence was relevant, linked to the query and source IDs for later evaluation.
+
+## Feature modules built on the shared foundation
+
+Treat ingestion, retrieval, and provider access as shared infrastructure. Implement each user-facing capability as a small feature module with its own input/output contract and evaluation cases. A feature module may compose shared application services, but should not issue ad hoc SQL, call a vector database directly, or own a private copy of the provider integration. This keeps the features independently developable and lets improvements to retrieval and provenance benefit all of them.
+
+| Feature module | Inputs and shared services | Output contract and behavior | Primary evaluation |
+|---|---|---|---|
+| **Review search and Q&A** | Natural-language query; typed review/diary/TMDb retrieval; structured SQLite lookups for ratings, dates, watched state, and other exact facts. | Answer only from supplied evidence. Return answer text plus source references (record/chunk ID, movie ID/title/year, source/content type, diary date, and excerpt). State when evidence is weak or absent; do not turn a review opinion into an objective movie fact. | Expected evidence retrieval, citation coverage, answer grounding, and empty/ambiguous query handling. |
+| **Recommendation explanations** | Ranked result from the existing deterministic recommender; score components/reasons; retrieval for relevant personal reviews or highly rated comparison films. | Preserve ranker order and scores. Add a concise explanation with separate computed, personal-review, and TMDb evidence references. If retrieval finds nothing useful, retain the deterministic explanation. | Ranking unchanged, evidence relevance, attribution accuracy, and fallback when retrieval/provider is unavailable. |
+| **Taste summaries and trend descriptions** | Aggregates computed by analysis services (rating distributions, time windows, entity affinity, genre/theme trends); retrieval for illustrative review excerpts. | Use computed results as the source of quantities and trends; use the model only to phrase/summarize them. Include time range, sample size, and references for examples; do not infer population-level claims from personal data. | Numeric fidelity to aggregates, temporal/filter correctness, evidence attribution, and no unsupported trends. |
+| **Natural-language preference parsing** | User request plus supported recommender/filter schema (runtime, year/decade, genres, tone/theme, anchor, watchlist/discovery scope, and available score weights). | Return a validated, typed proposal with explicit filters/weights, unresolved terms, and a human-readable summary. The UI lets the user inspect/edit it before calling the deterministic ranker; parsing alone never mutates preferences or watchlist state. | Schema validity, intent-to-filter accuracy, ambiguity handling, and confirmation/read-only behavior. |
+| **Filmweek personalization** | Existing Filmweek inputs and candidate validation; taste digest/aggregates; retrieval of relevant rated films and review evidence. | Keep the current curation contract and catalog verification. Add personal-evidence references to rationale where available; generated candidates remain subject to verification and never become library facts merely because the model returned them. | Candidate validity, evidence relevance, role diversity, and factual claim checks. |
+
+### Shared service contracts
+
+- Define framework-neutral services (for example `ReviewRetriever`, `LibraryQueryService`, `RecommendationService`, `TasteAnalysisService`, and `LLMProvider`) under application/service modules. Streamlit is a caller, not the owner of business logic; evaluation and other clients use the same contracts.
+- Retrieval accepts a query and bounded filters (source/content types, movie IDs, date/rating ranges, and result limit) and returns typed evidence records with stable source IDs, text, retrieval scores, and provenance. Support semantic, lexical, and hybrid modes without exposing backend-specific result shapes to feature modules.
+- Structured facts come from SQLite/application services. Semantic similarity comes from retrieval. A combined request may call both and return separately typed evidence; an LLM must not guess missing structured facts.
+- Define feature inputs/outputs as typed data (dataclasses or validated models), including source references and failure/empty states. Keep provider transport, prompt construction, parsing/validation, and feature policy in distinct layers.
+- Keep feature modules callable without Streamlit and allow deterministic checks with fake retrievers, repositories, and providers. Record model/provider and prompt/schema versions for generated results where appropriate; do not retain raw prompts/reviews in logs by default.
+- Feature modules may not call state-changing tools. Any later action (such as setting an anchor or adding a watchlist title) must be a separate explicit UI action with confirmation and its own application-service call.
+
+### Recommended implementation order
+
+1. Finish the shared corpus lifecycle: chunking, embedding/version tracking, hybrid retrieval, edit/deletion propagation, and a framework-neutral retrieval API.
+2. Build **review search and Q&A** first to validate evidence/provenance, empty-result behavior, provider disclosure, and the interface used by later modules.
+3. Add **recommendation explanations**, composing retrieval with the existing ranker without changing rank semantics.
+4. Add **taste summaries** using deterministic aggregates first, then optional review excerpts for examples.
+5. Add **natural-language preference parsing** as a constrained parser that proposes a validated request for user review before ranking.
+6. Extend **Filmweek personalization** through the same retrieval and analysis contracts; retain its separate curation policy and catalog-validation path.
+7. Add cross-feature evaluation cases and verify each module alone and with shared-service failures (provider unavailable, retrieval unavailable, stale index, and no evidence).
 
 ## Data and retrieval rules
 
@@ -60,6 +91,24 @@ The image labels SQLite scoring DB and pgvector store as existing/new components
 10. After retrieval or generation failures, offer structured search or deterministic ranking when the query permits it; clearly label the fallback and avoid presenting unsupported claims.
 11. Any state-changing action suggested by chat (watchlist, anchor, or curated week) requires an explicit user action and confirmation in the interface; ordinary question answering remains read-only.
 12. Provide a data-health view for import/sync freshness, identity resolution, review/metadata coverage, and retrieval-index freshness so users can diagnose weak or stale results.
+
+## Normalized retrieval corpus
+
+`retrieval_corpus` is the SQLite staging contract for later chunking and indexing. It has one typed record per source event and content type. `record_id` is a deterministic SHA-256 key over `source`, `source_event_id`, and `content_type`; the same tuple is also unique. `movie_id` retains the canonical `lowercase title (year)` library key. `text` contains the searchable content, while `watched_date`, `rating`, and `rewatch` retain diary context. `tmdb_id` links external metadata records to TMDb. `created_at` is retained across upserts and `updated_at` changes when source content or context changes.
+
+`retrieval_chunks` contains nonempty `review_text`, `tmdb_overview`, and `tmdb_genres` text. Short records remain intact; long records split on sentence/paragraph boundaries at a target of 200 model tokens, with 32-token overlap and an 8-token safety reserve under the model limit. Each chunk keeps the source record ID, stable chunk ID, chunk index/version, text hash, and serialized source provenance. `retrieval_embeddings` stores one active float32 unit vector per chunk, along with model ID/revision, vector dimension, source text hash, and timestamps. Unchanged text/model pairs reuse vectors; source edits refresh affected vectors; a model revision change rebuilds the active set. Foreign keys remove chunks and vectors when their corpus record is deleted. Diary context with empty text is retained in `retrieval_corpus` but is not embedded.
+
+The default model is [`sentence-transformers/all-MiniLM-L6-v2` at pinned revision `680353e66602ffe5bfc6cea86f57a6458ad7e6dd`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/commit/680353e66602ffe5bfc6cea86f57a6458ad7e6dd). Install the optional dependency with `pip install -e '.[embeddings]'`, then run `python scripts/build_retrieval_index.py`. The script requires local model weights; it reports a setup error if the optional library or model is unavailable. Hosted embedding adapters are a future extension of the backend interface.
+
+| Source | Content type | Text and context |
+|---|---|---|
+| `letterboxd_diary` | `diary_event` | Empty text; diary date, rating, and rewatch context for each export event. |
+| `letterboxd_diary` | `review_text` | Personal review text with the same event ID and diary context. |
+| `letterboxd_rss` | `diary_event` | Empty text; RSS event ID, date, rating, and rewatch context. RSS does not supply review text. |
+| `tmdb` | `tmdb_overview` | TMDb plot overview and TMDb ID. |
+| `tmdb` | `tmdb_genres` | Genre names joined as readable text and TMDb ID. |
+
+Letterboxd event IDs use an event-specific identifier from the source row when available. Otherwise, import derives an ID from `movie_id`, watched date, and that event's occurrence index in the source export; mutable review text and rating are excluded. TMDb event IDs use the canonical movie key plus the metadata field, while `tmdb_id` records the external catalog identity. Imports upsert by source/event/content type, so unchanged imports do not add records and edits refresh the existing record. Blank review text removes only its `review_text` record while preserving the diary event. `load_retrieval_corpus()` exposes the active, joined records for downstream corpus building.
 
 ## Delivery sequence
 

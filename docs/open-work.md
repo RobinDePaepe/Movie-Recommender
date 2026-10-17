@@ -1,16 +1,16 @@
 # Open Work
 
-Last reviewed: 2026-10-16.
+Last reviewed: 2026-10-17.
 
 The main product and engineering goal is to build the modules needed to realize the [RAG architecture](rag-architecture.md). This file is the active backlog. Older notes and detailed historical results are in `../archive/`.
 
 ## Priority 1 — Complete the RAG path
 
-1. **Review ingestion and normalization**
+1. **Review ingestion and normalization (implemented)**
    - Preserve Letterboxd review text, diary context, and stable movie/event identifiers during import.
    - Normalize imported reviews and TMDb plot/genre metadata into a documented retrieval corpus.
    - Make import and re-import idempotent; track source and source-event identifiers so updates do not create duplicate chunks.
-2. **Review chunking and embeddings**
+2. **Review chunking and embeddings (implemented)**
    - Define chunk boundaries and metadata for reviews, including movie, date, rating, and source identifiers where available.
    - Generate and refresh embeddings when source text changes; record model/version information.
 3. **pgvector retrieval store**
@@ -40,11 +40,23 @@ The main product and engineering goal is to build the modules needed to realize 
    - Once the core chat flow is usable, let the user mark answer usefulness and evidence relevance.
    - Store feedback with query and retrieved source identifiers so it can inform later evaluation and retrieval tuning.
 
+## Feature modules after shared retrieval
+
+Develop these as separate modules over the shared application services and typed evidence contract in [the RAG architecture](rag-architecture.md#feature-modules-built-on-the-shared-foundation). Each module should have its own interface, failure behavior, and evaluation cases; do not duplicate ingestion, retrieval, provider setup, or source attribution.
+
+1. **Review search and Q&A** — retrieve personal review evidence with provenance, combine with structured library facts when needed, and return cited answers with clear weak/no-evidence behavior.
+2. **Recommendation explanations** — enrich existing ranked results with relevant review or comparison-film evidence while preserving rank order and scores; retain deterministic explanations as fallback.
+3. **Taste summaries and trend descriptions** — compute counts and trends in analysis code, then use the LLM only to describe those results and select sourced examples.
+4. **Natural-language preference parsing** — parse user language into a validated recommender request, show the proposal for inspection/editing, and only then call the deterministic recommender.
+5. **Filmweek personalization** — connect the existing curator to shared taste aggregates and retrieval evidence while retaining candidate verification and the separate curation contract.
+
+Suggested sequence: complete the shared retrieval API and lifecycle first, then ship review search/Q&A as the proving feature, followed by recommendation explanations, taste summaries, preference parsing, and Filmweek personalization. This sequence can be adjusted if product priorities change, but later modules must keep the shared service boundaries and evidence rules.
+
 ## Priority 2 — Data quality and recommendation follow-up
 
 - Resolve the outstanding movie identity review queue and measure remaining unresolved records.
 - Add a data-health view for last import/sync times, unresolved identities, review and metadata coverage, and retrieval-index freshness, with clear next steps for stale or missing data.
-- Complete review-text ingestion and expose it in the library workflow. Diary review text is already retained when present in the export, but it is not yet normalized into a searchable review corpus.
+- Expose normalized review text and diary context in the library workflow for inspection.
 - Revisit the balance between Letterboxd list membership and personal taste signals using a checked-in ranking regression set.
 - Calibrate mood modes, Tonight's Pick diversity, and watchlist-versus-discovery balance against observed use.
 - Add persistent user preferences for scoring weights, variety, default taste mode, and filters.

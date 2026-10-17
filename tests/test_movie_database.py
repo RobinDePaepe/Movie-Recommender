@@ -1,6 +1,8 @@
 """Tests for the SQLite backend: feedback, curated weeks, and load round-trips."""
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 
@@ -189,3 +191,99 @@ def test_profile_preference_low_rating_becomes_veto(db):
     pref = mdb.load_profile_preferences(db).iloc[0]
     assert pref["rating"] == 1.5
     assert pref["veto"] == 1
+
+
+def test_letterboxd_import_builds_typed_corpus_and_updates_same_day_events(db, tmp_path, monkeypatch):
+    export_data = {
+        "ratings": pd.DataFrame(), "watched": pd.DataFrame(), "watchlist": pd.DataFrame(),
+        "likes": pd.DataFrame(), "lists": pd.DataFrame(),
+        "diary": pd.DataFrame([
+            {"Name": "Film", "Year": 2020, "movie_id": "film (2020)", "Watched Date": "2021-01-01", "Rating": 4.0, "Rewatch": "No"},
+            {"Name": "Film", "Year": 2020, "movie_id": "film (2020)", "Watched Date": "2021-01-01", "Rating": 4.5, "Rewatch": "Yes"},
+        ]),
+        "reviews": pd.DataFrame([
+            {"movie_id": "film (2020)", "Watched Date": "2021-01-01", "Rating": 4.0, "Rewatch": "No", "Review": "First review"},
+            {"movie_id": "film (2020)", "Watched Date": "2021-01-01", "Rating": 4.5, "Rewatch": "Yes", "Review": "Second review"},
+        ]),
+    }
+    monkeypatch.setattr(mdb, "ensure_export_dir", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(mdb, "load_letterboxd", lambda _path: export_data)
+
+    mdb.import_letterboxd_export(db_path=db)
+    first = mdb.load_retrieval_corpus(db)
+    reviews = first[first["content_type"] == "review_text"].sort_values("rating")
+    assert reviews["text"].tolist() == ["First review", "Second review"]
+    assert reviews["movie_id"].tolist() == ["film (2020)", "film (2020)"]
+    assert reviews["watched_date"].tolist() == ["2021-01-01", "2021-01-01"]
+    event_ids = reviews["source_event_id"].tolist()
+    assert len(set(event_ids)) == 2
+    assert set(reviews["source"]) == {"letterboxd_diary"}
+    assert reviews["rating"].tolist() == [4.0, 4.5]
+    assert first[first["content_type"] == "diary_event"]["rewatch"].sort_values().tolist() == [0, 1]
+
+    mdb.import_letterboxd_export(db_path=db)
+    unchanged = mdb.load_retrieval_corpus(db)
+    assert len(unchanged) == len(first)
+    assert unchanged[unchanged["content_type"] == "review_text"]["record_id"].tolist() == reviews["record_id"].tolist()
+
+    # Rating and review edits update the same event records because neither belongs
+    # in the fallback identity.
+    export_data["diary"].loc[0, "Rating"] = 3.5
+    export_data["reviews"].loc[0, "Rating"] = 3.5
+    export_data["reviews"].loc[0, "Review"] = "Edited review"
+    mdb.import_letterboxd_export(db_path=db)
+    second = mdb.load_retrieval_corpus(db)
+    updated = second[second["content_type"] == "review_text"].sort_values("rating")
+    assert updated["text"].tolist() == ["Edited review", "Second review"]
+    assert updated["source_event_id"].tolist() == event_ids
+    assert len(second[second["content_type"] == "diary_event"]) == 2
+
+
+def test_rss_and_tmdb_imports_upsert_typed_corpus_records(db, tmp_path):
+    sync_dir = tmp_path / "sync"
+    sync_dir.mkdir()
+    pd.DataFrame([{
+        "Name": "Film", "Year": 2020, "Watched Date": "2022-02-02", "Rewatch": True,
+        "Rating": 4.0, "movie_id": "film (2020)", "event_id": "letterboxd-review-99",
+    }]).to_csv(sync_dir / "diary_overlay.csv", index=False)
+    mdb.apply_rss_overlays_to_db(sync_dir=sync_dir, db_path=db)
+    mdb.apply_rss_overlays_to_db(sync_dir=sync_dir, db_path=db)
+    rss = mdb.load_retrieval_corpus(db)
+    rss = rss[rss["source"] == "letterboxd_rss"]
+    assert len(rss) == 1
+    assert rss.iloc[0]["source_event_id"] == "letterboxd-review-99"
+    assert rss.iloc[0]["text"] == ""
+    assert rss.iloc[0]["watched_date"] == "2022-02-02"
+
+    cache = tmp_path / "tmdb.json"
+    cache.write_text(json.dumps({"film": {
+        "name": "Film", "year": 2020, "tmdb_id": 123, "overview": "A plot.", "genres": ["Drama", "Mystery"]
+    }}), encoding="utf-8")
+    mdb.import_tmdb_cache(cache, db_path=db)
+    cache.write_text(json.dumps({"film": {
+        "name": "Film", "year": 2020, "tmdb_id": 123, "overview": "An updated plot.", "genres": ["Drama"]
+    }}), encoding="utf-8")
+    mdb.import_tmdb_cache(cache, db_path=db)
+    tmdb = mdb.load_retrieval_corpus(db)
+    tmdb = tmdb[tmdb["source"] == "tmdb"].set_index("content_type")
+    assert tmdb.loc["tmdb_overview", "text"] == "An updated plot."
+    assert tmdb.loc["tmdb_genres", "text"] == "Drama"
+    assert tmdb.loc["tmdb_overview", "tmdb_id"] == 123
+
+
+def test_letterboxd_import_keeps_optional_diary_fields_empty(db, tmp_path, monkeypatch):
+    export_data = {
+        "ratings": pd.DataFrame(), "watched": pd.DataFrame(), "watchlist": pd.DataFrame(),
+        "likes": pd.DataFrame(), "lists": pd.DataFrame(), "reviews": pd.DataFrame(),
+        "diary": pd.DataFrame([{"Name": "Undated Film", "Year": 2020, "movie_id": "undated film (2020)",
+                                "Watched Date": pd.NA, "Rating": pd.NA}]),
+    }
+    monkeypatch.setattr(mdb, "ensure_export_dir", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(mdb, "load_letterboxd", lambda _path: export_data)
+    mdb.import_letterboxd_export(db_path=db)
+    record = mdb.load_retrieval_corpus(db).iloc[0]
+    assert record["content_type"] == "diary_event"
+    assert record["watched_date"] is None or pd.isna(record["watched_date"])
+    assert pd.isna(record["rating"])
+    assert record["text"] == ""
+    assert record["source_event_id"] == "letterboxd:undated film (2020):unknown-date:0"
