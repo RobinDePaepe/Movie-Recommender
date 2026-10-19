@@ -39,6 +39,7 @@ from movie_recommender.curation.curator import CURATION_STYLES, anchor_options, 
 from movie_recommender.curation import llm_curator
 from movie_recommender.integrations import llm_providers
 from movie_recommender.ui.rate_review import render_reflection_panel
+from movie_recommender.ui.chat import render_chat_page
 from movie_recommender.recommendations.recommender import (
     ANCHOR_FOCUS_SCALE,
     HEURISTIC_WEIGHT,
@@ -501,8 +502,8 @@ found_count = int(metadata.get("tmdb_found", pd.Series(dtype=bool)).fillna(False
 
 ALL_MOODS = ["Tense", "Emotional", "Gritty", "Exciting", "Imaginative", "Light", "Reflective"]
 
-PAGES = ["Tonight's Pick", "Recommendations", "Curated Weeks", "Analysis", "Evaluation", "Reflection", "Library", "Data & Sync"]
-PAGE_ICONS = ["moon-stars", "bullseye", "calendar-week", "bar-chart", "clipboard-data", "chat-heart", "collection", "gear"]
+PAGES = ["Chat", "Tonight's Pick", "Recommendations", "Curated Weeks", "Analysis", "Evaluation", "Reflection", "Library", "Data & Sync"]
+PAGE_ICONS = ["chat-dots", "moon-stars", "bullseye", "calendar-week", "bar-chart", "clipboard-data", "chat-heart", "collection", "gear"]
 
 with st.sidebar:
     page = option_menu(
@@ -1283,7 +1284,10 @@ def render_analysis_page(data: Dict[str, pd.DataFrame], metadata: pd.DataFrame, 
         _analysis_tune_watched_tab(data, metadata, feedback)
 
 
-if page == "Tonight's Pick":
+if page == "Chat":
+    render_chat_page(db_path, use_database=use_database)
+
+elif page == "Tonight's Pick":
     st.subheader("What should I watch tonight?")
     render_feedback_impact()
     st.caption("One pick, committed. Adjust until it clicks — then hit 'This is perfect!'")

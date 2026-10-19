@@ -18,21 +18,17 @@ The main product and engineering goal is to build the modules needed to realize 
    - Idempotent publisher mirrors active SQLite chunks and embeddings, updating edits and removing deleted chunks.
    - `PgVectorRepository` provides semantic, lexical, and reciprocal-rank-fused hybrid search with provenance and structured filters.
    - Focused publisher/search tests pass; the optional PostgreSQL lifecycle test covers repeat publishing, evidence provenance, edits, and deletions in an isolated schema.
-4. **Application services and agent orchestration (next)**
-   - Define framework-neutral application services around the retrieval repository and existing SQLite library/recommender functions.
-   - Route exact library facts and filters to SQLite/application services, semantic opinion/theme questions to vector retrieval, and mixed questions to both.
-   - Add a small orchestrator that selects from narrow, documented retrieval and existing recommender/analysis tools.
-   - Keep deterministic ranking authoritative for ranked recommendations; use retrieved evidence to ground answers and explanations.
-   - Return source film/review references with answers so results can be inspected.
-   - Treat imported reviews and metadata as untrusted evidence, never as instructions. Keep tools read-only by default and test prompt-injection attempts in retrieved text.
-   - Make provider and data-sharing behavior explicit: disclose when review text leaves the device, avoid sending personal text to hosted models without a user-configured provider/workflow, and define chat-history retention and clearing behavior.
-   - Preserve clear source types in answers so personal opinions, TMDb facts, and computed recommendation results cannot be conflated.
-5. **Chat interface**
-   - Add a natural-language query interface for questions over the user's reviews and movie library.
-   - Show supporting films/reviews and handle empty or weak retrieval results clearly.
-   - For each cited item, show film title/year, review date or metadata source, a short excerpt, and a way to open the source record; let the user flag mismatched evidence.
-   - Remain useful when the LLM provider or vector store is unavailable: fall back to structured library search and deterministic recommendations, and label which evidence path produced the result.
-   - Add explicit user-triggered actions from answers, such as adding a film to the watchlist, using it as a recommendation anchor, or starting a curated week. Keep the initial query and answer tools read-only.
+4. **Application services and agent orchestration (implemented)**
+   - Framework-neutral typed adapters cover SQLite library lookups, pgvector retrieval, the existing deterministic ranker, and deterministic taste analyses (`src/movie_recommender/application/`).
+   - `ChatOrchestrator` routes structured, semantic, mixed, recommendation, and analysis requests; returns typed source references and labels evidence paths.
+   - Recommendation output preserves ranker order. Retrieval/provider failures are reported and semantic retrieval falls back to a structured library lookup.
+   - Query answering is read-only and stateless. The optional provider contract is opt-in; hosted providers do not receive personal library facts or Letterboxd excerpts unless `allow_hosted_personal_data=True`. Retrieved text is delimited and treated as untrusted evidence in the prompt.
+   - The route classifier is intentionally small and heuristic, and callers can supply validated `LibraryQuery`, retrieval filters, and recommendation requests. A concrete chat UI, provider selection UI, persistent chat-history controls, evaluation gate, and automated injection/privacy regression suite remain follow-up work.
+5. **Chat interface (implemented, initial slice)**
+   - The Chat page calls the framework-neutral orchestrator and services; it shows answer, evidence path, provider disclosure, and citation cards with title/year, source/date, excerpt, and a link to Letterboxd or TMDb.
+   - Empty evidence and unavailable services get explicit messages. Exact library answers remain deterministic; recent-watch queries use dated diary events and return in watch-date order. Users can constrain retrieval by title/source and flag mismatched evidence for the current session.
+   - Provider selection is explicit, defaults to off, and requires a separate opt-in before a hosted provider receives personal library evidence. Conversation history stays in session state and has a Clear chat control.
+   - Query and answer tools remain read-only. Persistent evidence feedback, evaluation, richer weak-evidence scoring, and separate follow-up actions remain future work.
 6. **Evaluation harness**
    - Build a fixed set of representative questions with expected evidence and repeatable retrieval/answer checks.
    - Report retrieval relevance, citation coverage, answer grounding, and recommendation ranking quality separately; retain the existing rating holdout metrics as one input, not the only measure.
