@@ -20,3 +20,9 @@ google-genai
 
 # Optional: enables semantic theme similarity and local retrieval embeddings. It pulls in
 # torch, so it is intentionally not a hard dependency. Install with `pip install -e '.[embeddings]'`.
+
+
+
+# Pgvector dependencies
+psycopg[binary]
+pgvector

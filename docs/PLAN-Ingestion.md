@@ -1,5 +1,9 @@
 # Plan: Review ingestion and normalization
 
+## Status: implemented
+
+The SQLite retrieval corpus implementation is complete. Letterboxd review/diary events and TMDb overview/genre records are normalized with stable IDs and idempotent upserts. Chunking, versioned local embeddings, and pgvector publishing/search are tracked in [the RAG architecture](rag-architecture.md) and [the active open-work list](open-work.md).
+
 ## Summary
 
 Create a documented, SQLite-backed retrieval corpus for Letterboxd reviews and diary events, plus TMDb plot and genre metadata. Keep the existing `movie_id` format, preserve source context, and make repeated imports update the same records instead of creating duplicates.
@@ -22,6 +26,6 @@ Create a documented, SQLite-backed retrieval corpus for Letterboxd reviews and d
 
 ## Assumptions
 
-- The normalized corpus is stored in SQLite beside the existing library; chunking, embeddings, and pgvector storage remain later work.
+- SQLite remains the canonical library and retrieval staging source. Chunking and embeddings are implemented in SQLite; the active index is published to PostgreSQL/pgvector for search.
 - The first slice covers full exports, current RSS sync overlays, and TMDb cache imports.
 - RSS contributes diary context only; review text comes from the full Letterboxd export.

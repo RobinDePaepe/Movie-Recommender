@@ -47,6 +47,29 @@ See `.env.example` for optional service keys and settings. Do not commit `.env` 
 
 Put the standard Letterboxd export ZIP at `data/letterboxd_export.zip`. The `data/` directory is ignored by Git because it contains personal exports, local databases, caches, and sync files.
 
+### Local pgvector database
+
+Start the local PostgreSQL database with pgvector:
+
+```bash
+docker compose up -d
+docker compose ps
+```
+
+Stop it and keep its data:
+
+```bash
+docker compose down
+```
+
+Reset it by removing the database volume and its data:
+
+```bash
+docker compose down -v
+```
+
+The database is available at `localhost:5432`. Connection settings are listed in `.env.example`. The app's existing library remains in SQLite.
+
 ## Run the app
 
 ```bash
@@ -67,14 +90,62 @@ To sync Letterboxd RSS manually and inspect sync status:
 python scripts/sync_letterboxd.py YOUR_LETTERBOXD_USERNAME --status
 ```
 
-To build or refresh the local retrieval chunks and embeddings, install the optional local model dependency and run:
+Build or refresh the local retrieval chunks and embeddings, then publish them to PostgreSQL. The publisher applies any pending SQL migrations before syncing rows:
 
 ```bash
 pip install -e '.[embeddings]'
 python scripts/build_retrieval_index.py
+python scripts/publish_retrieval_index.py
 ```
 
-The model runs locally and may download its pinned weights the first time. This command does not use a hosted embedding API.
+The model runs locally and may download its pinned weights the first time. Embedding does not use a hosted API. Publishing requires the local pgvector service to be running and uses the `POSTGRES_*` settings from `.env` (defaults match `compose.yaml`). The publisher is safe to repeat; it updates changed chunks and removes chunks no longer present in the active SQLite index.
+
+Application services can retrieve evidence with semantic, lexical, or hybrid ranking:
+
+```python
+from movie_recommender.retrieval import PgVectorRepository, RetrievalFilters
+
+evidence = PgVectorRepository().search(
+    "films with an uneasy dreamlike atmosphere",
+    mode="hybrid",
+    limit=8,
+    filters=RetrievalFilters(sources=("letterboxd_diary",), content_types=("review_text",)),
+)
+```
+
+Each result includes the chunk text, movie and source IDs, source type, and available review/TMDb provenance. Hybrid mode combines semantic and full-text rankings with reciprocal rank fusion. Search needs the pgvector database to be available; SQLite-backed library features continue to work separately.
+
+### Retrieval index operations
+
+After importing new Letterboxd or TMDb data, refresh SQLite chunks and embeddings and then publish them:
+
+```bash
+python scripts/build_retrieval_index.py
+python scripts/publish_retrieval_index.py
+```
+
+The publisher output's `source_chunks` and `published_chunks` counts should match. For a direct database check, inspect the row count and latest chunk modification time:
+
+```bash
+docker compose exec -T postgres psql -U movie_recommender -d movie_recommender \
+  -c "SELECT count(*) AS chunks, max(updated_at) AS latest_chunk_update FROM retrieval_chunks"
+```
+
+Compare that `chunks` count with SQLite's active index:
+
+```bash
+python -c "import sqlite3; db=sqlite3.connect('data/movie_recommender.sqlite'); print(db.execute('SELECT count(*) FROM retrieval_chunks').fetchone()[0])"
+```
+
+If PostgreSQL is unavailable, start it with `docker compose up -d` and retry the publish. The library and deterministic recommendation features remain in SQLite while retrieval is offline. If PostgreSQL is empty or was reset with `docker compose down -v`, run the build and publish commands again; the publisher reapplies migrations and repopulates the store. If new or edited source data is missing, rebuild SQLite chunks first, then publish. Publishing also removes rows for chunks that have been deleted from SQLite.
+
+Focused checks can be run with:
+
+```bash
+pytest tests/test_retrieval_publishing.py tests/test_retrieval_repository.py tests/test_pgvector_integration.py
+```
+
+The integration test uses a temporary PostgreSQL schema and skips unless `POSTGRES_TEST_DSN` points to a disposable test database. It covers repeated publishing, provenance in search results, edits, and deletions.
 
 ## Architecture
 

@@ -24,8 +24,8 @@ The image labels SQLite scoring DB and pgvector store as existing/new components
 |---|---|---|
 | Letterboxd export | Implemented | Source of complete ratings, diary entries, reviews, watchlist, and lists. Imports must be repeatable and preserve source identifiers. |
 | TMDb API | Implemented | Enrich titles with plot, genres, credits, keywords, and stable TMDb identity. |
-| Ingestion and chunking | Implemented through SQLite staging embeddings | Letterboxd export/RSS and TMDb cache imports populate a provenance-aware corpus. Nonempty review and TMDb text is chunked and embedded locally with edit/model refresh; pgvector serving remains future work. |
-| pgvector store | Not implemented | Store review-text embeddings and chunk metadata for semantic retrieval. Keep movie/source IDs that can be joined to SQLite records. Pair vector retrieval with PostgreSQL full-text search for exact titles, names, and phrases. |
+| Ingestion and chunking | Implemented through SQLite staging embeddings | Letterboxd export/RSS and TMDb cache imports populate a provenance-aware corpus. Nonempty review and TMDb text is chunked and embedded locally with edit/model refresh; the active chunks are published to pgvector for serving. |
+| pgvector store | Implemented and locally checked | A versioned migration and idempotent publisher mirror active SQLite chunks into pgvector. `PgVectorRepository` supports semantic, lexical, and reciprocal-rank-fused hybrid search with provenance-aware evidence and structured filters. Focused publisher/search tests and optional isolated PostgreSQL lifecycle checks are documented. |
 | SQLite library/recommender data | Implemented, with boundary to clarify | Keep canonical movie, rating, diary, feedback, reflection, availability, profile, and watchlist data. Scoring is currently calculated in the recommender module rather than stored as durable score rows. |
 | Agent orchestrator | Not implemented | Classify a user query, route to structured queries, semantic retrieval, or both, select from narrow application tools, assemble grounded results, and request a response from a configured LLM provider. It should not replace deterministic ranking. Make provider/data-sharing behavior explicit and preserve whether each claim came from personal review evidence, TMDb metadata, or computed results. |
 | Chat interface | Not implemented | Accept natural-language questions and show source cards with film title/year, review date or metadata source, short excerpt, and a link to the source record. Handle weak retrieval and service outages clearly; provide explicit follow-up actions such as watchlist add, recommendation anchor, or curated-week start. |
@@ -34,10 +34,10 @@ The image labels SQLite scoring DB and pgvector store as existing/new components
 ## Module boundaries
 
 - **Import adapters** read Letterboxd exports, Letterboxd RSS overlays, and TMDb responses. They produce normalized records and do not call an LLM.
-- **Corpus builder** selects text fields, creates review/metadata chunks, records provenance, and detects additions, edits, and deletions. `python scripts/build_retrieval_index.py` refreshes these SQLite staging chunks and embeddings.
+- **Corpus builder and publisher** select text fields, create review/metadata chunks, record provenance, and detect additions, edits, and deletions. `python scripts/build_retrieval_index.py` refreshes SQLite staging chunks and embeddings; `python scripts/publish_retrieval_index.py` applies pending PostgreSQL migrations and mirrors the active index to pgvector.
 - **Data lifecycle** propagates edits and deletions through normalized corpus rows, chunks, embeddings, and retrieval caches. Provide a safe full-index clear/rebuild operation and confirm deleted text cannot still be retrieved.
 - **Embedding service** batches and versions embeddings. The local `all-MiniLM-L6-v2` snapshot is pinned; a model/revision change rebuilds the active vectors consistently. The service boundary can accept a future hosted adapter, but this stage does not send review text to a provider.
-- **Vector repository** writes, deletes, and searches chunks in pgvector. It returns chunk text, similarity, and provenance rather than an untraceable text blob. Pair semantic retrieval with PostgreSQL full-text search, then fuse or rerank results; pgvector documents hybrid search with Reciprocal Rank Fusion and cross-encoders ([pgvector hybrid search](https://github.com/pgvector/pgvector#hybrid-search)).
+- **Vector repository** The publisher handles writes; `PgVectorRepository` searches chunks in pgvector using semantic, lexical, or reciprocal-rank-fused hybrid ranking. It returns chunk text, scores, and provenance rather than an untraceable text blob. pgvector documents hybrid search with Reciprocal Rank Fusion and cross-encoders ([pgvector hybrid search](https://github.com/pgvector/pgvector#hybrid-search)).
 - **SQLite repositories and application services** remain the source for structured filters, ratings, watch state, feedback, profiles, and deterministic recommendations.
 - **Orchestrator** routes exact facts and filters to SQLite/application services, semantic questions to retrieval, and mixed questions to both. It constructs a bounded evidence context and produces a response with source references. Expose narrow tools and default to read-only behavior.
 - **Provider boundary** makes the selected model/provider and whether personal review text is sent off-device visible to the user. Define chat-history retention and a clear-history operation; do not send personal review text to a hosted model unless the user-configured provider/workflow explicitly does so. Support local providers where practical.
@@ -58,6 +58,14 @@ Treat ingestion, retrieval, and provider access as shared infrastructure. Implem
 | **Natural-language preference parsing** | User request plus supported recommender/filter schema (runtime, year/decade, genres, tone/theme, anchor, watchlist/discovery scope, and available score weights). | Return a validated, typed proposal with explicit filters/weights, unresolved terms, and a human-readable summary. The UI lets the user inspect/edit it before calling the deterministic ranker; parsing alone never mutates preferences or watchlist state. | Schema validity, intent-to-filter accuracy, ambiguity handling, and confirmation/read-only behavior. |
 | **Filmweek personalization** | Existing Filmweek inputs and candidate validation; taste digest/aggregates; retrieval of relevant rated films and review evidence. | Keep the current curation contract and catalog verification. Add personal-evidence references to rationale where available; generated candidates remain subject to verification and never become library facts merely because the model returned them. | Candidate validity, evidence relevance, role diversity, and factual claim checks. |
 
+### Later extension: film podcast transcripts
+
+Podcast transcripts are a possible additional retrieval source, motivated by the user's interest in shows such as *The Big Picture* and *The Rewatchables*. Treat them as an optional feature built on the shared corpus and retrieval services, after the initial Letterboxd/TMDb path is working. They can provide outside criticism and discussion that may help explain or explore the user's movie interests, but they are not evidence of the user's own opinion or viewing history.
+
+If this is pursued, ingest a small, deliberately selected sample first, ideally episodes about films already present in the Letterboxd library. Keep podcast material in its own source/content types, separate from `letterboxd_diary` and `tmdb`, and retain show, episode title, episode URL, publication date, speaker when available, and timestamps or segment boundaries. Link a segment to a canonical `movie_id` only when the film reference is clear; otherwise retain the episode-level record without inventing a movie link. Chunk around speaker turns or coherent discussion segments where practical, and preserve enough episode context to make retrieved excerpts understandable.
+
+Retrieval and answer presentation must identify podcast discussion as attributed external commentary. Cite the show, episode, speaker, and timestamp/segment when available; do not blend it into personal reviews, treat it as an objective film fact, or infer that the user agrees with a host. Evaluate the sample with queries that distinguish personal-review evidence from podcast commentary, and check retrieval relevance and attribution before expanding the corpus. Keep a source link and respect the source's access terms; transcript availability, permitted reuse, and redistribution rights need to be assessed before building an importer or sharing transcript text. No podcast transcript importer or corpus schema is part of the current ingestion slice.
+
 ### Shared service contracts
 
 - Define framework-neutral services (for example `ReviewRetriever`, `LibraryQueryService`, `RecommendationService`, `TasteAnalysisService`, and `LLMProvider`) under application/service modules. Streamlit is a caller, not the owner of business logic; evaluation and other clients use the same contracts.
@@ -69,7 +77,7 @@ Treat ingestion, retrieval, and provider access as shared infrastructure. Implem
 
 ### Recommended implementation order
 
-1. Finish the shared corpus lifecycle: chunking, embedding/version tracking, hybrid retrieval, edit/deletion propagation, and a framework-neutral retrieval API.
+1. Build framework-neutral application services over the completed shared corpus lifecycle and retrieval repository; route exact facts to SQLite and semantic evidence to pgvector.
 2. Build **review search and Q&A** first to validate evidence/provenance, empty-result behavior, provider disclosure, and the interface used by later modules.
 3. Add **recommendation explanations**, composing retrieval with the existing ranker without changing rank semantics.
 4. Add **taste summaries** using deterministic aggregates first, then optional review excerpts for examples.
@@ -112,10 +120,10 @@ Letterboxd event IDs use an event-specific identifier from the source row when a
 
 ## Delivery sequence
 
-1. Specify and validate the review corpus schema and idempotent import behavior.
-2. Implement chunking and embedding refresh, first with a local development corpus.
-3. Add pgvector setup, migrations/schema management, and a vector repository with provenance-aware search.
-4. Expose retrieval, recommendation, and analysis through application-service interfaces.
+1. **Complete:** Specify and validate the review corpus schema and idempotent import behavior.
+2. **Complete:** Implement chunking and embedding refresh, first with a local development corpus.
+3. **Complete:** Add pgvector setup, migrations/schema management, idempotent publishing, and provenance-aware semantic, lexical, and hybrid search. Verify repeat publish and edit/deletion propagation with focused and optional integration checks.
+4. **Next:** Expose retrieval, recommendation, and analysis through framework-neutral application-service interfaces.
 5. Implement the orchestrator and define tool contracts, evidence limits, and failure/empty-result behavior.
 6. Add the chat interface and evidence display.
 7. Add a fixed-query evaluation set with expected evidence; measure retrieval relevance, citation coverage, answer grounding, and ranking regressions separately. Run it as a release gate and use results to tune chunking and retrieval.

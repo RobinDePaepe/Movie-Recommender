@@ -1,6 +1,6 @@
 # Open Work
 
-Last reviewed: 2026-10-17.
+Last reviewed: 2026-10-19.
 
 The main product and engineering goal is to build the modules needed to realize the [RAG architecture](rag-architecture.md). This file is the active backlog. Older notes and detailed historical results are in `../archive/`.
 
@@ -13,11 +13,13 @@ The main product and engineering goal is to build the modules needed to realize 
 2. **Review chunking and embeddings (implemented)**
    - Define chunk boundaries and metadata for reviews, including movie, date, rating, and source identifiers where available.
    - Generate and refresh embeddings when source text changes; record model/version information.
-3. **pgvector retrieval store**
-   - Add a pgvector-backed store for review and metadata chunks, with a documented local setup and rebuild path.
-   - Define how the store relates to the existing SQLite library and how IDs keep the two stores in sync.
-   - Combine semantic vector search with PostgreSQL full-text search for exact titles, people, and phrases as well as conceptual matches; evaluate Reciprocal Rank Fusion or another simple result-fusion method.
-4. **Retrieval and agent orchestration**
+3. **pgvector retrieval store (implemented and locally checked)**
+   - Versioned PostgreSQL migration and Docker Compose setup for pgvector.
+   - Idempotent publisher mirrors active SQLite chunks and embeddings, updating edits and removing deleted chunks.
+   - `PgVectorRepository` provides semantic, lexical, and reciprocal-rank-fused hybrid search with provenance and structured filters.
+   - Focused publisher/search tests pass; the optional PostgreSQL lifecycle test covers repeat publishing, evidence provenance, edits, and deletions in an isolated schema.
+4. **Application services and agent orchestration (next)**
+   - Define framework-neutral application services around the retrieval repository and existing SQLite library/recommender functions.
    - Route exact library facts and filters to SQLite/application services, semantic opinion/theme questions to vector retrieval, and mixed questions to both.
    - Add a small orchestrator that selects from narrow, documented retrieval and existing recommender/analysis tools.
    - Keep deterministic ranking authoritative for ranked recommendations; use retrieved evidence to ground answers and explanations.
@@ -50,7 +52,7 @@ Develop these as separate modules over the shared application services and typed
 4. **Natural-language preference parsing** — parse user language into a validated recommender request, show the proposal for inspection/editing, and only then call the deterministic recommender.
 5. **Filmweek personalization** — connect the existing curator to shared taste aggregates and retrieval evidence while retaining candidate verification and the separate curation contract.
 
-Suggested sequence: complete the shared retrieval API and lifecycle first, then ship review search/Q&A as the proving feature, followed by recommendation explanations, taste summaries, preference parsing, and Filmweek personalization. This sequence can be adjusted if product priorities change, but later modules must keep the shared service boundaries and evidence rules.
+Suggested sequence: add framework-neutral application services and orchestration over the completed retrieval API, then ship review search/Q&A as the proving feature, followed by recommendation explanations, taste summaries, preference parsing, and Filmweek personalization. Later modules should keep the shared service boundaries and evidence rules.
 
 ## Priority 2 — Data quality and recommendation follow-up
 
