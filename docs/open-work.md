@@ -4,7 +4,7 @@ Last reviewed: 2026-10-19.
 
 The main product and engineering goal is to build the modules needed to realize the [RAG architecture](rag-architecture.md). This file is the active backlog. Older notes and detailed historical results are in `../archive/`.
 
-## Priority 1 — Complete the RAG path
+## Priority 1 — Make the initial RAG path reliable
 
 1. **Review ingestion and normalization (implemented)**
    - Preserve Letterboxd review text, diary context, and stable movie/event identifiers during import.
@@ -18,37 +18,38 @@ The main product and engineering goal is to build the modules needed to realize 
    - Idempotent publisher mirrors active SQLite chunks and embeddings, updating edits and removing deleted chunks.
    - `PgVectorRepository` provides semantic, lexical, and reciprocal-rank-fused hybrid search with provenance and structured filters.
    - Focused publisher/search tests pass; the optional PostgreSQL lifecycle test covers repeat publishing, evidence provenance, edits, and deletions in an isolated schema.
-4. **Application services and agent orchestration (implemented)**
+4. **Application services and orchestration (initial slice implemented; hardening remains)**
    - Framework-neutral typed adapters cover SQLite library lookups, pgvector retrieval, the existing deterministic ranker, and deterministic taste analyses (`src/movie_recommender/application/`).
    - `ChatOrchestrator` routes structured, semantic, mixed, recommendation, and analysis requests; returns typed source references and labels evidence paths.
    - Recommendation output preserves ranker order. Retrieval/provider failures are reported and semantic retrieval falls back to a structured library lookup.
    - Query answering is read-only and stateless. The optional provider contract is opt-in; hosted providers do not receive personal library facts or Letterboxd excerpts unless `allow_hosted_personal_data=True`. Retrieved text is delimited and treated as untrusted evidence in the prompt.
-   - The route classifier is intentionally small and heuristic, and callers can supply validated `LibraryQuery`, retrieval filters, and recommendation requests. A concrete chat UI, provider selection UI, persistent chat-history controls, evaluation gate, and automated injection/privacy regression suite remain follow-up work.
+   - The route classifier is intentionally small and heuristic. Callers can supply validated `LibraryQuery`, retrieval filters, and recommendation requests, but free-text parsing does not yet cover all intents the router recognizes (for example, count questions).
+   - Remaining: validate generated citations against returned source IDs; strengthen structured request parsing and ambiguous-query handling; test privacy/provider routing, prompt injection, errors, and fallbacks. The implementation has no RAG evaluation release gate yet.
 5. **Chat interface (implemented, initial slice)**
    - The Chat page calls the framework-neutral orchestrator and services; it shows answer, evidence path, provider disclosure, and citation cards with title/year, source/date, excerpt, and a link to Letterboxd or TMDb.
    - Empty evidence and unavailable services get explicit messages. Exact library answers remain deterministic; recent-watch queries use dated diary events and return in watch-date order. Users can constrain retrieval by title/source and flag mismatched evidence for the current session.
    - Provider selection is explicit, defaults to off, and requires a separate opt-in before a hosted provider receives personal library evidence. Conversation history stays in session state and has a Clear chat control.
-   - Query and answer tools remain read-only. Persistent evidence feedback, evaluation, richer weak-evidence scoring, and separate follow-up actions remain future work.
-6. **Evaluation harness**
+   - Query and answer tools remain read-only. Mismatch flags and conversation history are session-only. Persistent evidence feedback, richer weak-evidence scoring, and separate follow-up actions remain future work.
+6. **Evaluation harness (not implemented for RAG)**
    - Build a fixed set of representative questions with expected evidence and repeatable retrieval/answer checks.
    - Report retrieval relevance, citation coverage, answer grounding, and recommendation ranking quality separately; retain the existing rating holdout metrics as one input, not the only measure.
    - Make the evaluation set a release gate for changes to chunking, embedding models, retrieval, prompts, and ranking integration.
    - Include source attribution, privacy/provider routing, stale or deleted source handling, prompt-injection resistance, and degraded-mode behavior in the evaluation checklist.
-7. **Answer feedback loop**
-   - Once the core chat flow is usable, let the user mark answer usefulness and evidence relevance.
+7. **Answer feedback loop (not implemented)**
+   - Let the user mark answer usefulness and evidence relevance.
    - Store feedback with query and retrieved source identifiers so it can inform later evaluation and retrieval tuning.
 
 ## Feature modules after shared retrieval
 
-Develop these as separate modules over the shared application services and typed evidence contract in [the RAG architecture](rag-architecture.md#feature-modules-built-on-the-shared-foundation). Each module should have its own interface, failure behavior, and evaluation cases; do not duplicate ingestion, retrieval, provider setup, or source attribution.
+Develop these as separate modules over the shared application services and typed evidence contract in [the RAG architecture](rag-architecture.md#feature-modules-built-on-the-shared-foundation). The current chat is an initial review Q&A slice; it still needs the reliability and evaluation work above. Each later module should have its own interface, failure behavior, and evaluation cases; do not duplicate ingestion, retrieval, provider setup, or source attribution.
 
-1. **Review search and Q&A** — retrieve personal review evidence with provenance, combine with structured library facts when needed, and return cited answers with clear weak/no-evidence behavior.
+1. **Review search and Q&A hardening** — validate citations and structured intents, test weak/no-evidence and service failure behavior, and make the initial chat slice reliable before expanding its scope.
 2. **Recommendation explanations** — enrich existing ranked results with relevant review or comparison-film evidence while preserving rank order and scores; retain deterministic explanations as fallback.
 3. **Taste summaries and trend descriptions** — compute counts and trends in analysis code, then use the LLM only to describe those results and select sourced examples.
 4. **Natural-language preference parsing** — parse user language into a validated recommender request, show the proposal for inspection/editing, and only then call the deterministic recommender.
 5. **Filmweek personalization** — connect the existing curator to shared taste aggregates and retrieval evidence while retaining candidate verification and the separate curation contract.
 
-Suggested sequence: add framework-neutral application services and orchestration over the completed retrieval API, then ship review search/Q&A as the proving feature, followed by recommendation explanations, taste summaries, preference parsing, and Filmweek personalization. Later modules should keep the shared service boundaries and evidence rules.
+Suggested sequence: (1) harden the current review search/Q&A slice and its provider/privacy boundaries; (2) add the fixed RAG evaluation set and make it a release gate; (3) persist answer/evidence feedback; then (4) build recommendation explanations, taste summaries, preference parsing, and Filmweek personalization. Add data-health reporting and safe index rebuild/clear operations alongside this work. Keep later modules on the shared service boundaries and evidence rules.
 
 ## Priority 2 — Data quality and recommendation follow-up
 
@@ -72,9 +73,9 @@ Suggested sequence: add framework-neutral application services and orchestration
 
 - Add versioned database migrations and typed validation for imported data, settings, and tool requests.
 - Add structured operational logs and backups around mutating import, sync, and enrichment workflows.
-- Propagate source edits and deletions through normalized corpus records, chunks, embeddings, and retrieval caches; provide a safe full-index clear/rebuild operation and verify that removed review text is no longer retrievable.
+- Source edits and deletions already propagate through SQLite corpus records, chunks, embeddings, and pgvector publishing. Still provide a safe full-index clear/rebuild operation and include deleted-source checks in the evaluation gate.
 - Cache reusable data loading and scoring across Streamlit reruns where it measurably improves responsiveness.
-- Keep service boundaries independent of Streamlit so the orchestrator and evaluation harness can use the same import, retrieval, recommendation, and analysis functions.
+- Application services and orchestration are framework-neutral; keep the evaluation harness on those same interfaces and avoid moving retrieval/business logic into Streamlit.
 
 ## Conditional work
 

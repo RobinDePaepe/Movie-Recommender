@@ -1,6 +1,6 @@
 # RAG Architecture
 
-Last reviewed: 2026-10-17.
+Last reviewed: 2026-10-19.
 
 The primary design goal is to implement the modules in [`RAG architecture.png`](RAG%20architecture.png). The application should answer natural-language questions using the user's Letterboxd history and movie metadata, retrieve the evidence behind those answers, and call the existing deterministic recommender when ranking is needed. Route structured library facts to SQLite and semantic questions about themes or review opinions to text retrieval; combine both paths when a question needs both.
 
@@ -27,15 +27,15 @@ The image labels SQLite scoring DB and pgvector store as existing/new components
 | Ingestion and chunking | Implemented through SQLite staging embeddings | Letterboxd export/RSS and TMDb cache imports populate a provenance-aware corpus. Nonempty review and TMDb text is chunked and embedded locally with edit/model refresh; the active chunks are published to pgvector for serving. |
 | pgvector store | Implemented and locally checked | A versioned migration and idempotent publisher mirror active SQLite chunks into pgvector. `PgVectorRepository` supports semantic, lexical, and reciprocal-rank-fused hybrid search with provenance-aware evidence and structured filters. Focused publisher/search tests and optional isolated PostgreSQL lifecycle checks are documented. |
 | SQLite library/recommender data | Implemented, with boundary to clarify | Keep canonical movie, rating, diary, feedback, reflection, availability, profile, and watchlist data. Scoring is currently calculated in the recommender module rather than stored as durable score rows. |
-| Agent orchestrator | Implemented (initial service layer) | `movie_recommender.application` exposes typed library, retrieval, recommendation, and taste-analysis services plus a read-only query router. It routes structured queries to SQLite, semantic queries to pgvector, mixed queries to both, recommendation requests to the deterministic ranker, and explicit taste-summary/trend requests to analysis functions. It returns typed references and evidence-path labels. The classifier is heuristic and a provider is optional/opt-in; hosted personal-data sharing requires explicit configuration. |
-| Chat interface | Implemented (initial slice) | The Streamlit Chat page calls application services, shows evidence-path/provider disclosures and source cards with title/year, date/source, excerpt, and source link, and handles empty/unavailable paths. Exact library answers remain deterministic, including diary-date sorting for recent-watch queries. It supports session-only mismatch flags, session-local conversation history with Clear chat, explicit provider choice, and consent before hosted transmission of personal library evidence. Query-answer tools are read-only; persistent feedback, evaluation, and explicit follow-up actions remain future work. |
-| Evaluation harness | Partial | The app has rating holdout metrics (including MAE, Precision@10, and NDCG). A fixed RAG query set and separate retrieval relevance, citation coverage, answer-grounding, privacy-routing, lifecycle, injection-resistance, and degraded-mode checks are still needed. |
+| Agent orchestrator | Implemented (initial service layer; hardening remains) | `movie_recommender.application` exposes typed library, retrieval, recommendation, and taste-analysis services plus a read-only query router. It routes structured, semantic, mixed, recommendation, and analysis requests and returns typed references and evidence-path labels. The classifier and free-text parser are heuristic; some recognized intents are not yet represented by a matching structured query (for example, counts). Generated citation IDs are not yet validated against returned evidence. Provider use is optional; hosted personal-data sharing requires explicit configuration. |
+| Chat interface | Implemented (initial slice; reliability work remains) | The Streamlit Chat page calls application services, shows evidence-path/provider disclosures and source cards with title/year, date/source, excerpt, and source link, and handles empty/unavailable paths. Exact library answers remain deterministic, including diary-date sorting for recent-watch queries. Provider choice is explicit, hosted personal evidence requires consent, mismatch flags and conversation history are session-only, and query-answer tools are read-only. |
+| Evaluation harness | Partial; RAG evaluation not implemented | Existing rating holdout metrics include MAE, Precision@10, and NDCG. A fixed RAG query set and separate retrieval relevance, citation coverage, answer-grounding, privacy-routing, lifecycle, injection-resistance, and degraded-mode checks are still needed before the chat path can be treated as a release-gated feature. |
 
 ## Module boundaries
 
 - **Import adapters** read Letterboxd exports, Letterboxd RSS overlays, and TMDb responses. They produce normalized records and do not call an LLM.
 - **Corpus builder and publisher** select text fields, create review/metadata chunks, record provenance, and detect additions, edits, and deletions. `python scripts/build_retrieval_index.py` refreshes SQLite staging chunks and embeddings; `python scripts/publish_retrieval_index.py` applies pending PostgreSQL migrations and mirrors the active index to pgvector.
-- **Data lifecycle** propagates edits and deletions through normalized corpus rows, chunks, embeddings, and retrieval caches. Provide a safe full-index clear/rebuild operation and confirm deleted text cannot still be retrieved.
+- **Data lifecycle** propagates edits and deletions through normalized corpus rows, chunks, embeddings, and pgvector publishing. A safe full-index clear/rebuild operation and an evaluated check that deleted text cannot still be retrieved remain outstanding.
 - **Embedding service** batches and versions embeddings. The local `all-MiniLM-L6-v2` snapshot is pinned; a model/revision change rebuilds the active vectors consistently. The service boundary can accept a future hosted adapter, but this stage does not send review text to a provider.
 - **Vector repository** The publisher handles writes; `PgVectorRepository` searches chunks in pgvector using semantic, lexical, or reciprocal-rank-fused hybrid ranking. It returns chunk text, scores, and provenance rather than an untraceable text blob. pgvector documents hybrid search with Reciprocal Rank Fusion and cross-encoders ([pgvector hybrid search](https://github.com/pgvector/pgvector#hybrid-search)).
 - **SQLite repositories and application services** remain the source for structured filters, ratings, watch state, feedback, profiles, and deterministic recommendations.
@@ -43,8 +43,8 @@ The image labels SQLite scoring DB and pgvector store as existing/new components
 - **Provider boundary** makes the selected model/provider and whether personal review text is sent off-device visible to the user. Define chat-history retention and a clear-history operation; do not send personal review text to a hosted model unless the user-configured provider/workflow explicitly does so. Support local providers where practical.
 - **Degraded behavior** keeps structured search and deterministic recommendations available when the vector store or LLM provider is unavailable. Label which path produced each result and do not imply that a generated answer was grounded when retrieval failed.
 - **UI** is a client of application services. It should not contain retrieval logic or direct SQL for the new RAG path.
-- **Evaluation** runs offline against fixed queries and held-out data, recording retrieval relevance, citation coverage, answer grounding, ranking metrics, and latency. Evaluate retrieval and generation separately; RAG evaluation research treats them as distinct components ([RAGAS paper](https://arxiv.org/abs/2309.15217)). Use the fixed set as a release gate when changing chunking, models, retrieval, prompts, or ranking integration.
-- **Answer feedback** (after the first usable chat flow) records whether an answer was useful and whether its cited evidence was relevant, linked to the query and source IDs for later evaluation.
+- **Evaluation (outstanding)** should run offline against fixed queries and held-out data, recording retrieval relevance, citation coverage, answer grounding, ranking metrics, privacy routing, degraded behavior, and latency. Evaluate retrieval and generation separately; RAG evaluation research treats them as distinct components ([RAGAS paper](https://arxiv.org/abs/2309.15217)). Use the fixed set as a release gate when changing chunking, models, retrieval, prompts, or ranking integration.
+- **Answer feedback (outstanding)** should record whether an answer was useful and whether its cited evidence was relevant, linked to the query and source IDs for later evaluation. Current mismatch flags are session-only.
 
 ## Feature modules built on the shared foundation
 
@@ -75,15 +75,16 @@ Retrieval and answer presentation must identify podcast discussion as attributed
 - Keep feature modules callable without Streamlit and allow deterministic checks with fake retrievers, repositories, and providers. Record model/provider and prompt/schema versions for generated results where appropriate; do not retain raw prompts/reviews in logs by default.
 - Feature modules may not call state-changing tools. Any later action (such as setting an anchor or adding a watchlist title) must be a separate explicit UI action with confirmation and its own application-service call.
 
-### Recommended implementation order
+### Remaining implementation order
 
-1. Build framework-neutral application services over the completed shared corpus lifecycle and retrieval repository; route exact facts to SQLite and semantic evidence to pgvector.
-2. Build **review search and Q&A** first to validate evidence/provenance, empty-result behavior, provider disclosure, and the interface used by later modules.
-3. Add **recommendation explanations**, composing retrieval with the existing ranker without changing rank semantics.
-4. Add **taste summaries** using deterministic aggregates first, then optional review excerpts for examples.
-5. Add **natural-language preference parsing** as a constrained parser that proposes a validated request for user review before ranking.
-6. Extend **Filmweek personalization** through the same retrieval and analysis contracts; retain its separate curation policy and catalog-validation path.
-7. Add cross-feature evaluation cases and verify each module alone and with shared-service failures (provider unavailable, retrieval unavailable, stale index, and no evidence).
+1. Harden the initial **review search and Q&A** slice: cover structured intents, validate model citations against returned evidence, distinguish empty results from unavailable services, and verify provider/privacy behavior and injection resistance.
+2. Add the fixed **RAG evaluation harness** and use it as a release gate for retrieval, generation, privacy, lifecycle, and degraded-mode changes.
+3. Add persistent **answer and evidence feedback** linked to query and source IDs.
+4. Add **recommendation explanations**, composing retrieval with the existing ranker without changing rank semantics.
+5. Add **taste summaries** using deterministic aggregates first, then optional review excerpts for examples.
+6. Add **natural-language preference parsing** as a constrained parser that proposes a validated request for user review before ranking.
+7. Extend **Filmweek personalization** through the same retrieval and analysis contracts; retain its separate curation policy and catalog-validation path.
+8. Add the safe full-index clear/rebuild operation and data-health reporting for imports, coverage, identity resolution, and index freshness; verify stale and deleted-source behavior through evaluation.
 
 ## Data and retrieval rules
 
@@ -124,10 +125,11 @@ Letterboxd event IDs use an event-specific identifier from the source row when a
 2. **Complete:** Implement chunking and embedding refresh, first with a local development corpus.
 3. **Complete:** Add pgvector setup, migrations/schema management, idempotent publishing, and provenance-aware semantic, lexical, and hybrid search. Verify repeat publish and edit/deletion propagation with focused and optional integration checks.
 4. **Complete (initial slice):** Expose retrieval, recommendation, and SQLite library queries through framework-neutral typed services in `src/movie_recommender/application/`.
-5. **Complete (initial slice):** Implement read-only routing, typed citations, bounded retrieval, provider/privacy policy, and degraded-mode behavior. Replace heuristic intent parsing with validated structured requests as chat UX is built.
-6. **Complete (initial slice):** Add the Streamlit chat interface and evidence display. Continue with usability refinements, persistent evidence feedback, and follow-up action flows after evaluation coverage is in place.
-7. Add a fixed-query evaluation set with expected evidence; measure retrieval relevance, citation coverage, answer grounding, and ranking regressions separately. Run it as a release gate and use results to tune chunking and retrieval.
-8. Add answer usefulness and evidence-relevance feedback, linked to the query and retrieved source IDs, after the first chat flow is usable.
-9. Add explicit user-triggered actions from evidence-backed answers, then add data-health reporting for source and index freshness.
+5. **Complete (initial slice):** Implement read-only routing, bounded retrieval, typed source references, provider/privacy policy, and basic degraded-mode reporting. Structured intent parsing and model citation validation remain incomplete.
+6. **Complete (initial slice):** Add the Streamlit chat interface and evidence display. Conversation history and mismatch flags are session-only; persistent answer feedback and explicit follow-up action flows remain future work.
+7. **Next:** Harden structured routing, citation validation, provider/privacy behavior, injection resistance, and empty/error handling in the initial chat path.
+8. Add a fixed-query evaluation set with expected evidence; measure retrieval relevance, citation coverage, answer grounding, and ranking regressions separately. Run it as a release gate and use results to tune chunking and retrieval.
+9. Add answer usefulness and evidence-relevance feedback, linked to the query and retrieved source IDs.
+10. Add explicit user-triggered actions from evidence-backed answers, plus data-health reporting and a safe index clear/rebuild workflow.
 
 Track implementation tasks in [`open-work.md`](open-work.md). Update the component table as each module is completed; keep the diagram and this document aligned when the target changes.
